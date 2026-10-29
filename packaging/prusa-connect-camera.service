@@ -1,0 +1,25 @@
+[Unit]
+Description=Upload Raspberry Pi camera snapshots to Prusa Connect
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/prusa-connect-camera run --config /etc/prusa-connect-camera/config.toml
+# One line per [[camera]] in the config, named after its id. Each file holds only that
+# camera's token and is readable by this service alone.
+LoadCredential=cam0:/etc/prusa-connect-camera/credentials/cam0
+Restart=always
+RestartSec=10
+WatchdogSec=60
+
+DynamicUser=yes
+SupplementaryGroups=video
+StateDirectory=prusa-connect-camera
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+# prusa-connect-camera config; install it as /etc/prusa-connect-camera/config.toml.
+
+# connect_url = "https://connect.prusa3d.com"
+# Where each camera's fingerprint is kept. Matches StateDirectory= in the systemd unit.
+# state_dir = "/var/lib/prusa-connect-camera"
+
+[[camera]]
+# Names the fingerprint file and the systemd credential that holds this camera's token:
+# LoadCredential=cam0:/etc/prusa-connect-camera/credentials/cam0
+id = "cam0"
+# Shown in Prusa Connect. Set after the first successful upload.
+name = "Printer cam"
+# Seconds between uploads. Prusa Connect's minimum is 10.
+interval = 10
+# Skip uploads while the printer's web interface doesn't answer; Prusa Connect discards
+# snapshots while the printer is offline anyway.
+# printer_check = "192.168.1.25:80"
+# Read the token from a file instead of a systemd credential, e.g. when testing by hand.
+# token_file = "/home/pi/cam0.token"
+
+[camera.source]
+type = "rpicam"
+# index = 0               # from `prusa-connect-camera list-cameras`
+# The defaults suit Camera Module v2: its whole view at about 240 KB per upload, 2 GB a day.
+# Its full resolution is 3280x2464; Camera Module 3's is 4608x2592. Some sizes crop the view:
+# `list-cameras` shows which sensor modes cover the whole sensor.
+# width = 2048
+# height = 1536
+# framerate = 1           # uploads use the newest frame; more frames only cost CPU
+# quality = 50            # JPEG quality, 1-100. Size roughly halves from 85 to 65
+# rotation = 0            # 0 or 180
+# hflip = false
+# vflip = false
+# lens_position = 3.0     # Camera Module 3 only: fixed focus in dioptres (1 / metres)
+# extra_args = ["--denoise", "cdn_off"]
+# command = "rpicam-vid"  # "libcamera-vid" on releases before Bookworm
+
+# A second camera, e.g. on a Pi 5 or Compute Module with two camera ports:
+# [[camera]]
+# id = "cam1"
+# [camera.source]
+# type = "rpicam"
+# index = 1

@@ -1,0 +1,11 @@
+# Cross-compiling a static binary for 64-bit Raspberry Pi OS:
+#   rustup target add aarch64-unknown-linux-musl
+#   cargo build --release --target aarch64-unknown-linux-musl
+# Needs clang, for the C code in ring (TLS). The linker ships with Rust.
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[env]
+CC_aarch64_unknown_linux_musl = "clang"
+CFLAGS_aarch64_unknown_linux_musl = "--target=aarch64-unknown-linux-musl"
