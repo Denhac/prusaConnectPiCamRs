@@ -93,9 +93,15 @@ impl Client {
         self.put("/c/snapshot", "image/jpg", jpeg)
     }
 
-    pub fn set_name(&self, name: &str) -> Result<u16, ConnectError> {
-        let body = serde_json::json!({ "config": { "name": name } }).to_string();
-        self.put("/c/info", "application/json", body.as_bytes())
+    /// Sets the camera's name. A camera offering live view also declares itself a web camera
+    /// with live view, as Prusa's browser webcam does.
+    pub fn set_info(&self, name: &str, live: bool) -> Result<u16, ConnectError> {
+        let mut body = serde_json::json!({ "config": { "name": name } });
+        if live {
+            body["type"] = "WEB".into();
+            body["features"] = serde_json::json!(crate::live::FEATURES);
+        }
+        self.put("/c/info", "application/json", body.to_string().as_bytes())
     }
 
     fn put(&self, path: &str, content_type: &str, body: &[u8]) -> Result<u16, ConnectError> {

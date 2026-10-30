@@ -4,14 +4,15 @@ Uploads snapshots from Raspberry Pi cameras to [Prusa Connect](https://connect.p
 so a printer without its own camera gets one in the Connect dashboard.
 
 It runs as one small service per Pi. It keeps `rpicam-vid` streaming at a low frame rate and
-uploads the newest frame every 10 seconds. Because the camera stays running, exposure and white
+uploads the newest frame every 15 seconds. Because the camera stays running, exposure and white
 balance stay settled, unlike starting `rpicam-still` for every snapshot.
 
-**Status:** early. Runs on a Raspberry Pi 4 with a Camera Module v2 under Raspberry Pi OS Trixie.
-At the default 2048x1536 and JPEG quality 50 it uses about 5% of one core and 70 MB of memory,
-and uploads about 240 KB every 10 seconds: 2.1 GB a day, 63 GB a month. Full resolution
-(3280x2464) at quality 85 costs about 12% of a core and 13 GB a day. Most of the CPU goes to
-`rpicam-vid` encoding a JPEG every second.
+**Status:** early. Runs on a Raspberry Pi 4 with a Camera Module v2 under Raspberry Pi OS Trixie,
+with snapshots and [live view](#live-view) in Prusa Connect.
+At the default 2048x1536, JPEG quality 50 and one upload every 15 seconds it uses about 5% of
+one core and 70 MB of memory, and uploads about 240 KB at a time: 1.4 GB a day, 42 GB a month.
+Full resolution (3280x2464) at quality 85 costs about 12% of a core and 8.6 GB a day. Most of
+the CPU goes to `rpicam-vid` encoding a JPEG every second.
 
 ## Requirements
 
@@ -109,6 +110,31 @@ different fingerprint. Delete and re-add it in Prusa Connect to start over, and 
 Add a `[[camera]]` section per camera (see [config.example.toml](config.example.toml)), each
 with its own token from Prusa Connect, and a matching `LoadCredential=` line in the unit.
 
+## Live view
+
+Prusa Connect can also show a live stream from the camera, with a play button over its picture.
+For this the program acts as a Prusa "web camera": it speaks the same signaling and WebRTC
+protocol as Prusa's browser webcam app, and streams H.264 from the Pi's hardware encoder while
+someone watches. Snapshots pause during that time and resume afterwards.
+
+1. In Prusa Connect, open the printer's **Camera** tab and add a **web camera** rather than
+   "Add new other camera", and copy its token.
+2. Within 15 minutes, install with live view turned on:
+
+   ```shell
+   deploy/deploy.sh install rpi-bot-green --live
+   ```
+
+   Or set `live = true` in the camera's section of the config.
+
+- One viewer at a time, as with Prusa's webcam. Connect asks for SD (640x480), HD (1280x960) or
+  Full HD (1640x1232); all show the camera's whole view (`live_mode`).
+- On a Pi 4 a stream costs about 8% of one core.
+- The viewer connects directly when it can: on the LAN, over Tailscale, or through NAT with
+  STUN. Otherwise the stream goes through Prusa's TURN relay, which Prusa limits to SD on free
+  accounts.
+- The protocol is undocumented. It follows Prusa's webcam app (version 0.3.6) and may change.
+
 ## Commands
 
 | Command | What it does |
@@ -141,6 +167,8 @@ Use a separate test camera in Prusa Connect so a real camera's fingerprint isn't
 - An install script or `.deb`.
 - An in-process camera backend using the [`libcamera`](https://crates.io/crates/libcamera) crate.
 - Find out which `/c/info` settings Prusa Connect accepts besides `name`.
+- Live view: TURN over TCP and TLS (webrtc-rs relays over UDP only), for viewers behind
+  firewalls that block UDP; and snapshots while someone watches.
 
 ## Acknowledgements
 

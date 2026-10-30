@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use sd_notify::NotifyState;
 
-use crate::config::{CameraConfig, Config};
+use crate::config::{CameraConfig, Config, SourceConfig};
 use crate::connect::{Client, ConnectError, REQUEST_TIMEOUT};
 use crate::fingerprint;
-use crate::source::{self, CAPTURE_TIMEOUT, FrameSource};
+use crate::live;
+use crate::source::rpicam::Rpicam;
+use crate::source::{self, CAPTURE_TIMEOUT, FrameSource, Paused};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const PRINTER_TIMEOUT: Duration = Duration::from_secs(2);
@@ -28,19 +30,40 @@ struct Camera {
     printer_check: Option<String>,
     client: Client,
     source: Box<dyn FrameSource>,
+    /// Set when the camera offers live view; taken by [`run`] to start it.
+    live: Option<live::Camera>,
+    live_enabled: bool,
 }
 
 impl Camera {
     fn open(config: &Config, camera: &CameraConfig) -> Result<Self> {
         let token = camera.load_token()?;
         let fingerprint = fingerprint::load_or_create(&config.state_dir, &camera.id)?;
+        let (source, live): (Box<dyn FrameSource>, _) = match &camera.source {
+            SourceConfig::Rpicam(rpicam_config) => {
+                let rpicam = Rpicam::start(rpicam_config)?;
+                let live = camera.live.then(|| live::Camera {
+                    id: camera.id.clone(),
+                    name: camera.name.clone().unwrap_or_else(|| camera.id.clone()),
+                    token: token.clone(),
+                    fingerprint: fingerprint.clone(),
+                    hardware: live::hardware(),
+                    resolution: (rpicam_config.width, rpicam_config.height),
+                    source: rpicam.clone(),
+                });
+                (Box::new(rpicam), live)
+            }
+            other => (source::open(other)?, None),
+        };
         Ok(Self {
             id: camera.id.clone(),
             name: camera.name.clone(),
             interval: camera.interval(),
             printer_check: camera.printer_check.clone(),
             client: Client::new(&config.connect_url, token, fingerprint),
-            source: source::open(&camera.source)?,
+            source,
+            live_enabled: live.is_some(),
+            live,
         })
     }
 
@@ -60,13 +83,16 @@ impl Camera {
         Ok(status)
     }
 
-    /// Sets the camera's name in Prusa Connect. Called after a successful upload, so the
-    /// camera is registered by then.
-    fn apply_name(&self) {
-        let Some(name) = &self.name else { return };
-        match self.client.set_name(name) {
+    /// Sets the camera's name in Prusa Connect, and declares live view when it's offered.
+    /// Called after a successful upload, so the camera is registered by then.
+    fn apply_info(&self) {
+        let live = self.live_enabled;
+        let Some(name) = self.name.as_deref().or(live.then_some(self.id.as_str())) else {
+            return;
+        };
+        match self.client.set_info(name, live) {
             Ok(_) => log::info!("[{}] camera name set to {name:?}", self.id),
-            Err(e) => log::warn!("[{}] couldn't set the camera name: {e}", self.id),
+            Err(e) => log::warn!("[{}] couldn't update the camera's details: {e}", self.id),
         }
     }
 
@@ -104,10 +130,14 @@ impl Camera {
                                 self.id,
                                 self.interval.as_secs()
                             );
-                            self.apply_name();
+                            self.apply_info();
                         }
                         uploading = true;
                         failures = 0;
+                        self.interval
+                    }
+                    Err(e) if e.is::<Paused>() => {
+                        log::debug!("[{}] {e}", self.id);
                         self.interval
                     }
                     Err(e) => {
@@ -148,11 +178,19 @@ fn reachable(addr: &str) -> bool {
 }
 
 pub fn run(config: &Config) -> Result<()> {
-    let cameras: Vec<Camera> = config
+    let mut cameras: Vec<Camera> = config
         .cameras
         .iter()
         .map(|c| Camera::open(config, c))
         .collect::<Result<_>>()?;
+
+    let mut live_threads = Vec::new();
+    for camera in &mut cameras {
+        if let Some(live_camera) = camera.live.take() {
+            let handle = live::spawn(config.signaling_url.clone(), live_camera)?;
+            live_threads.push((camera.id.clone(), handle));
+        }
+    }
 
     let mut workers = Vec::new();
     for camera in cameras {
@@ -180,6 +218,9 @@ pub fn run(config: &Config) -> Result<()> {
                 bail!("camera {id}'s upload loop is stuck");
             }
         }
+        if let Some((id, _)) = live_threads.iter().find(|(_, handle)| handle.is_finished()) {
+            bail!("camera {id}'s live view crashed");
+        }
         if watchdog.is_some() {
             let _ = sd_notify::notify(&[NotifyState::Watchdog]);
         }
@@ -196,7 +237,7 @@ pub fn test(config: &Config, camera: &CameraConfig) -> Result<()> {
         camera.id,
         camera.client.fingerprint()
     );
-    camera.apply_name();
+    camera.apply_info();
     Ok(())
 }
 

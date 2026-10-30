@@ -11,14 +11,15 @@ readonly repo
 usage() {
   cat <<'EOF'
 Usage:
-  deploy/deploy.sh install HOST [--token-file FILE] [--name NAME] [--fingerprint VALUE]
+  deploy/deploy.sh install HOST [--token-file FILE] [--name NAME] [--fingerprint VALUE] [--live]
   deploy/deploy.sh upgrade HOST...
 
 install  Sets up a Pi with its Prusa Connect camera token and a fresh config naming the
          camera NAME (default: HOST). Use it for a new Pi, or to give a Pi a new token.
          Without --token-file you are asked for the token. A token different from the
          Pi's current one gets a new fingerprint, unless --fingerprint imports the one
-         the camera is already registered with.
+         the camera is already registered with. --live offers live view in Prusa
+         Connect, which needs a token from "Add web camera".
 upgrade  Replaces the program and its systemd unit on Pis that are already installed.
          Their tokens, config and fingerprints are left alone.
 
@@ -50,6 +51,7 @@ user=rpi
 token_file=""
 name=""
 fingerprint=""
+live=false
 build=true
 check_camera=true
 while (( $# )); do
@@ -59,6 +61,7 @@ while (( $# )); do
     --token-file) token_file=${2:?--token-file needs a value}; shift ;;
     --name) name=${2:?--name needs a value}; shift ;;
     --fingerprint) fingerprint=${2:?--fingerprint needs a value}; shift ;;
+    --live) live=true ;;
     --skip-build) build=false ;;
     --skip-camera-check) check_camera=false ;;
     -*) die "unknown option: $1 (see --help)" ;;
@@ -73,8 +76,9 @@ case $mode in
     ;;
   upgrade)
     (( ${#hosts[@]} > 0 )) || die "upgrade needs at least one host"
-    [[ -z $token_file$name$fingerprint ]] ||
-      die "upgrade keeps each Pi's token, name and fingerprint; use install to change them"
+    if [[ -n $token_file$name$fingerprint ]] || $live; then
+      die "upgrade keeps each Pi's token and config; use install to change them"
+    fi
     ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -163,20 +167,23 @@ make_bundle() {
   files=(prusa-connect-camera prusa-connect-camera.service remote.sh)
   if [[ $mode == install ]]; then
     printf '%s\n' "$token" >"$dir/token"
-    write_config "${name:-$host}" <"$repo/config.example.toml" >"$dir/config.toml"
+    write_config "${name:-$host}" "$live" <"$repo/config.example.toml" >"$dir/config.toml"
     files+=(token config.toml)
   fi
   (cd "$dir" && sha256sum -- "${files[@]}" >SHA256SUMS)
 }
 
-# Copies the example config from stdin to stdout with the camera's name set.
+# Copies the example config from stdin to stdout with the camera's name set, and live view
+# turned on when LIVE is true.
 write_config() {
-  local value=$1 line
+  local value=$1 live=$2 line
   value=${value//\\/\\\\}
   value=${value//\"/\\\"}
   while IFS= read -r line; do
     if [[ $line == 'name = '* ]]; then
       printf 'name = "%s"\n' "$value"
+    elif [[ $line == '# live = false' ]] && $live; then
+      printf 'live = true\n'
     else
       printf '%s\n' "$line"
     fi

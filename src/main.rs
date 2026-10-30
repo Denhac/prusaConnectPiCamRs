@@ -1,6 +1,7 @@
 mod config;
 mod connect;
 mod fingerprint;
+mod live;
 mod runner;
 mod source;
 
@@ -80,11 +81,16 @@ enum FingerprintAction {
 }
 
 fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        // ureq-proto logs protocol state at debug and hex-dumps each request, Token header
-        // included, at trace. Neither is useful here, whatever RUST_LOG asks for.
-        .filter_module("ureq_proto", log::LevelFilter::Info)
-        .init();
+    // The WebRTC crates (rtc, rtc_ice, webrtc, …) log failed connectivity checks and refused
+    // relay permissions as errors on every connection, though they're part of normal ICE. Live
+    // view logs each session's outcome itself, so they're off unless RUST_LOG asks for them.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,rtc=off,webrtc=off"),
+    )
+    // ureq-proto logs protocol state at debug and hex-dumps each request, Token header
+    // included, at trace. Neither is useful here, whatever RUST_LOG asks for.
+    .filter_module("ureq_proto", log::LevelFilter::Info)
+    .init();
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

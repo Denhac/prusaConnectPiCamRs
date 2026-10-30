@@ -15,6 +15,9 @@ pub const MIN_INTERVAL: Duration = Duration::from_secs(10);
 pub struct Config {
     #[serde(default = "default_connect_url")]
     pub connect_url: String,
+    /// Prusa's camera signaling server, used for live view.
+    #[serde(default = "default_signaling_url")]
+    pub signaling_url: String,
     /// Holds each camera's fingerprint.
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
@@ -37,6 +40,10 @@ pub struct CameraConfig {
     pub printer_check: Option<String>,
     /// File holding the Prusa Connect token. Defaults to the systemd credential named after `id`.
     pub token_file: Option<PathBuf>,
+    /// Offer live view in Prusa Connect. Needs a "Web camera" token and the rpicam source;
+    /// snapshots pause while someone watches.
+    #[serde(default)]
+    pub live: bool,
     pub source: SourceConfig,
 }
 
@@ -47,7 +54,7 @@ pub enum SourceConfig {
     File(FileConfig),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RpicamConfig {
     /// Program to run; `libcamera-vid` on Raspberry Pi OS releases before Bookworm.
@@ -69,6 +76,11 @@ pub struct RpicamConfig {
     pub vflip: bool,
     /// Fixes the focus of an autofocus camera (Camera Module 3), in dioptres (1 / metres).
     pub lens_position: Option<f32>,
+    /// Sensor mode for live view, as rpicam-vid's `--mode WIDTH:HEIGHT`. The default is Camera
+    /// Module v2's 2x2-binned mode, which sees the whole sensor area at half its full resolution
+    /// (3280x2464), so live view shows the whole view at every size; left to itself,
+    /// rpicam-vid picks a cropped mode for small sizes. Empty lets it choose.
+    pub live_mode: String,
     /// Extra rpicam-vid options. Don't repeat options this program already sets.
     pub extra_args: Vec<String>,
 }
@@ -86,6 +98,7 @@ impl Default for RpicamConfig {
             hflip: false,
             vflip: false,
             lens_position: None,
+            live_mode: "1640:1232".into(),
             extra_args: Vec::new(),
         }
     }
@@ -102,12 +115,16 @@ fn default_connect_url() -> String {
     "https://connect.prusa3d.com".into()
 }
 
+fn default_signaling_url() -> String {
+    "https://camera-signaling.prusa3d.com".into()
+}
+
 fn default_state_dir() -> PathBuf {
     "/var/lib/prusa-connect-camera".into()
 }
 
 fn default_interval() -> u64 {
-    MIN_INTERVAL.as_secs()
+    15
 }
 
 impl Config {
@@ -160,6 +177,11 @@ impl Config {
                 ensure!(
                     rpicam.framerate > 0.0,
                     "camera {id}: framerate must be above 0"
+                );
+            } else {
+                ensure!(
+                    !camera.live,
+                    "camera {id}: live view needs the rpicam source"
                 );
             }
         }
@@ -219,6 +241,7 @@ impl CameraConfig {
 }
 
 /// A Prusa Connect camera token. `Debug` is redacted so it can't end up in logs.
+#[derive(Clone)]
 pub struct Token(String);
 
 impl Token {
@@ -255,7 +278,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.connect_url, "https://connect.prusa3d.com");
         let camera = config.camera(None).unwrap();
-        assert_eq!(camera.interval(), MIN_INTERVAL);
+        assert_eq!(camera.interval(), Duration::from_secs(15));
         let SourceConfig::Rpicam(rpicam) = &camera.source else {
             panic!("expected rpicam")
         };

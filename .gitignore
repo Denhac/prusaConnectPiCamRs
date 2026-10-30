@@ -1,1 +1,22 @@
+# Build output
 /target
+
+# Secrets kept around for local testing or deploys: Prusa Connect camera tokens, and the
+# SSHPASS / PI_SUDO_PASSWORD variables deploy/deploy.sh reads
+*.token
+/credentials/
+.env
+.envrc
+
+# Local test runs: configs, fingerprint state, logs, and the `snapshot` command's default output
+/config.toml
+*.fingerprint
+*.log
+/snapshot.jpg
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

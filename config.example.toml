@@ -11,12 +11,15 @@ id = "cam0"
 # Shown in Prusa Connect. Set after the first successful upload.
 name = "Printer cam"
 # Seconds between uploads. Prusa Connect's minimum is 10.
-interval = 10
+interval = 15
 # Skip uploads while the printer's web interface doesn't answer; Prusa Connect discards
 # snapshots while the printer is offline anyway.
 # printer_check = "192.168.1.25:80"
 # Read the token from a file instead of a systemd credential, e.g. when testing by hand.
 # token_file = "/home/pi/cam0.token"
+# Offer live view in Prusa Connect. Needs a token from "Add web camera" rather than "Add new
+# other camera". Snapshots pause while someone watches.
+# live = false
 
 [camera.source]
 type = "rpicam"
@@ -32,6 +35,9 @@ type = "rpicam"
 # hflip = false
 # vflip = false
 # lens_position = 3.0     # Camera Module 3 only: fixed focus in dioptres (1 / metres)
+# live_mode = "1640:1232" # sensor mode for live view: Camera Module v2's 2x2-binned mode,
+#                         # which sees the whole sensor area at half its full resolution
+#                         # (3280x2464). "" lets rpicam-vid choose, which can crop the view
 # extra_args = ["--denoise", "cdn_off"]
 # command = "rpicam-vid"  # "libcamera-vid" on releases before Bookworm
 
