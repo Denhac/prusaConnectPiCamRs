@@ -80,6 +80,8 @@ pub struct Session {
     pub request_id: String,
     pub request: proto::Webrtc,
     pub camera: Rpicam,
+    /// The size of the sensor mode live view reads, which gives its streams their shape.
+    pub sensor_size: (u32, u32),
     pub out: mpsc::Sender<Outgoing>,
     /// Closed by signaling to end the session.
     pub commands: mpsc::Receiver<Command>,
@@ -129,22 +131,29 @@ impl Drop for TaskGuard {
     }
 }
 
-/// The stream to encode for a request: Prusa's webcam presets, at the 4:3 aspect of the whole
-/// sensor of a Camera Module v2.
-pub fn stream_for(settings: Option<&proto::VideoSettings>, relay_only: bool) -> LiveStream {
+/// The stream to encode for a request: the widths and bitrates of Prusa's webcam presets, with
+/// the sensor mode's shape so nothing is cropped, and never wider than the mode itself.
+pub fn stream_for(
+    settings: Option<&proto::VideoSettings>,
+    relay_only: bool,
+    (sensor_width, sensor_height): (u32, u32),
+) -> LiveStream {
     let (quality, framerate) = match settings {
         Some(s) => (s.video_quality(), Some(s.video_fps).filter(|&fps| fps > 0)),
         None if relay_only => (VideoQuality::Sd, Some(RELAY_FPS)),
         None => (VideoQuality::Hd, None),
     };
-    let (width, height, bitrate) = match quality {
-        VideoQuality::Sd => (640, 480, 900_000),
-        VideoQuality::Fhd => (1640, 1232, 6_500_000),
-        VideoQuality::Hd | VideoQuality::Invalid => (1280, 960, 2_500_000),
+    let (width, bitrate) = match quality {
+        VideoQuality::Sd => (640, 900_000),
+        VideoQuality::Fhd => (1920, 6_500_000),
+        VideoQuality::Hd | VideoQuality::Invalid => (1280, 2_500_000),
     };
+    let width = width.min(sensor_width);
+    let height = u64::from(width) * u64::from(sensor_height) / u64::from(sensor_width);
     LiveStream {
-        width,
-        height,
+        // The H.264 encoder needs even dimensions.
+        width: width & !1,
+        height: height as u32 & !1,
         framerate: framerate.unwrap_or(DEFAULT_FPS),
         bitrate,
     }
@@ -154,7 +163,7 @@ async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
     let ice = s.request.ice_configuration.clone().unwrap_or_default();
     let video = s.request.video_settings.clone();
     let relay_only = ice.ice_transport_policy() == IcePolicy::Relay;
-    let stream = stream_for(video.as_ref(), relay_only);
+    let stream = stream_for(video.as_ref(), relay_only, s.sensor_size);
     log::info!(
         "[{}] live view requested: {}x{} at {} fps, {} kbit/s{}",
         s.camera_id,
@@ -659,6 +668,18 @@ fn scope_applies(scope: Option<ApplyScope>, kind: &str) -> bool {
 mod tests {
     use super::*;
 
+    const MODULE_2: (u32, u32) = (1640, 1232);
+    const MODULE_3: (u32, u32) = (2304, 1296);
+
+    fn size(quality: VideoQuality, sensor: (u32, u32)) -> (u32, u32) {
+        let settings = proto::VideoSettings {
+            video_quality: quality as i32,
+            ..Default::default()
+        };
+        let stream = stream_for(Some(&settings), false, sensor);
+        (stream.width, stream.height)
+    }
+
     #[test]
     fn picks_stream_settings() {
         let fhd = proto::VideoSettings {
@@ -667,7 +688,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            stream_for(Some(&fhd), false),
+            stream_for(Some(&fhd), false, MODULE_2),
             LiveStream {
                 width: 1640,
                 height: 1232,
@@ -675,9 +696,9 @@ mod tests {
                 bitrate: 6_500_000
             }
         );
-        assert_eq!(stream_for(None, false).framerate, DEFAULT_FPS);
+        assert_eq!(stream_for(None, false, MODULE_2).framerate, DEFAULT_FPS);
         assert_eq!(
-            stream_for(None, true),
+            stream_for(None, true, MODULE_2),
             LiveStream {
                 width: 640,
                 height: 480,
@@ -685,6 +706,16 @@ mod tests {
                 bitrate: 900_000
             }
         );
+    }
+
+    #[test]
+    fn streams_take_the_shape_of_the_sensor_mode() {
+        assert_eq!(size(VideoQuality::Sd, MODULE_2), (640, 480));
+        assert_eq!(size(VideoQuality::Hd, MODULE_2), (1280, 960));
+        assert_eq!(size(VideoQuality::Fhd, MODULE_2), (1640, 1232));
+        assert_eq!(size(VideoQuality::Sd, MODULE_3), (640, 360));
+        assert_eq!(size(VideoQuality::Hd, MODULE_3), (1280, 720));
+        assert_eq!(size(VideoQuality::Fhd, MODULE_3), (1920, 1080));
     }
 
     #[test]

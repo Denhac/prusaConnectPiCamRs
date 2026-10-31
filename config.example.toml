@@ -24,9 +24,11 @@ interval = 15
 [camera.source]
 type = "rpicam"
 # index = 0               # from `prusa-connect-camera list-cameras`
-# The defaults suit Camera Module v2: its whole view at about 240 KB per upload, 2 GB a day.
-# Its full resolution is 3280x2464; Camera Module 3's is 4608x2592. Some sizes crop the view:
-# `list-cameras` shows which sensor modes cover the whole sensor.
+# The defaults suit Camera Module v2, whose sensor is 4:3: its whole view at about 240 KB per
+# upload, 1.4 GB a day. Its full resolution is 3280x2464. Camera Module 3 is 16:9 (4608x2592),
+# so 4:3 sizes cut off its sides: use width = 2304, height = 1296 and live_mode = "2304:1296",
+# which `deploy/deploy.sh install` sets for you. `list-cameras` shows which sensor modes cover
+# the whole sensor.
 # width = 2048
 # height = 1536
 # framerate = 1           # uploads use the newest frame; more frames only cost CPU
@@ -37,7 +39,8 @@ type = "rpicam"
 # lens_position = 3.0     # Camera Module 3 only: fixed focus in dioptres (1 / metres)
 # live_mode = "1640:1232" # sensor mode for live view: Camera Module v2's 2x2-binned mode,
 #                         # which sees the whole sensor area at half its full resolution
-#                         # (3280x2464). "" lets rpicam-vid choose, which can crop the view
+#                         # (3280x2464). Live view takes its shape from this. "" lets
+#                         # rpicam-vid choose, which can crop the view
 # extra_args = ["--denoise", "cdn_off"]
 # command = "rpicam-vid"  # "libcamera-vid" on releases before Bookworm
 

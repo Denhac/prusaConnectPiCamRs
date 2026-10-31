@@ -7,9 +7,9 @@ It runs as one small service per Pi. It keeps `rpicam-vid` streaming at a low fr
 uploads the newest frame every 15 seconds. Because the camera stays running, exposure and white
 balance stay settled, unlike starting `rpicam-still` for every snapshot.
 
-**Status:** early. Runs on a Raspberry Pi 4 with a Camera Module v2 under Raspberry Pi OS Trixie,
-with snapshots and [live view](#live-view) in Prusa Connect.
-At the default 2048x1536, JPEG quality 50 and one upload every 15 seconds it uses about 5% of
+**Status:** early. Runs on a Raspberry Pi 4 with a Camera Module v2 or 3 under Raspberry Pi OS
+Trixie, with snapshots and [live view](#live-view) in Prusa Connect.
+On a Camera Module v2 at the default 2048x1536, JPEG quality 50 and one upload every 15 seconds it uses about 5% of
 one core and 70 MB of memory, and uploads about 240 KB at a time: 1.4 GB a day, 42 GB a month.
 Full resolution (3280x2464) at quality 85 costs about 12% of a core and 8.6 GB a day. Most of
 the CPU goes to `rpicam-vid` encoding a JPEG every second.
@@ -43,7 +43,9 @@ cargo build --release
 ## Deploy over SSH
 
 `deploy/deploy.sh` builds the program and sets it up on Pis over SSH. Before copying anything,
-it checks that each Pi runs 64-bit Raspberry Pi OS and has a working camera.
+it checks that each Pi runs 64-bit Raspberry Pi OS and has a working camera. `install` also fits
+the config to the camera: the defaults suit Camera Module v2, and a Camera Module 3 gets its 16:9
+sizes.
 
 ```shell
 # A new Pi, or a new token. Asks for the token unless given --token-file.
@@ -127,8 +129,9 @@ someone watches. Snapshots pause during that time and resume afterwards.
 
    Or set `live = true` in the camera's section of the config.
 
-- One viewer at a time, as with Prusa's webcam. Connect asks for SD (640x480), HD (1280x960) or
-  Full HD (1640x1232); all show the camera's whole view (`live_mode`).
+- One viewer at a time, as with Prusa's webcam. Connect asks for SD, HD or Full HD, and all show
+  the camera's whole view, with the shape of `live_mode`: 640x480, 1280x960 and 1640x1232 on a
+  Camera Module v2, 640x360, 1280x720 and 1920x1080 on a Camera Module 3.
 - On a Pi 4 a stream costs about 8% of one core.
 - The viewer connects directly when it can: on the LAN, over Tailscale, or through NAT with
   STUN. Otherwise the stream goes through Prusa's TURN relay, which Prusa limits to SD on free

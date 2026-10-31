@@ -33,6 +33,8 @@ pub struct Camera {
     pub hardware: String,
     /// The snapshot resolution, reported as the camera's current one.
     pub resolution: (u32, u32),
+    /// The size of the sensor mode live view reads.
+    pub sensor_size: (u32, u32),
     pub source: Rpicam,
 }
 
@@ -266,6 +268,7 @@ impl Signaling<'_> {
             request_id,
             request,
             camera: self.camera.source.clone(),
+            sensor_size: self.camera.sensor_size,
             out: self.out.clone(),
             commands: receiver,
         }));

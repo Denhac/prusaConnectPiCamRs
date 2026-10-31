@@ -49,6 +49,7 @@ impl Camera {
                     fingerprint: fingerprint.clone(),
                     hardware: live::hardware(),
                     resolution: (rpicam_config.width, rpicam_config.height),
+                    sensor_size: rpicam_config.live_sensor_size(),
                     source: rpicam.clone(),
                 });
                 (Box::new(rpicam), live)

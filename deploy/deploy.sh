@@ -15,7 +15,8 @@ Usage:
   deploy/deploy.sh upgrade HOST...
 
 install  Sets up a Pi with its Prusa Connect camera token and a fresh config naming the
-         camera NAME (default: HOST). Use it for a new Pi, or to give a Pi a new token.
+         camera NAME (default: HOST), with sizes that fit its camera. Use it for a new Pi,
+         or to give a Pi a new token.
          Without --token-file you are asked for the token. A token different from the
          Pi's current one gets a new fingerprint, unless --fingerprint imports the one
          the camera is already registered with. --live offers live view in Prusa
@@ -161,22 +162,28 @@ binary=$repo/target/$TARGET/release/prusa-connect-camera
 
 # Writes the files for HOST into DIR, with checksums so the Pi can verify the transfer.
 make_bundle() {
-  local host=$1 dir=$2 files
+  local host=$1 dir=$2 sensor=$3 files
   mkdir -p "$dir"
   cp "$binary" "$repo/packaging/prusa-connect-camera.service" "$repo/deploy/remote.sh" "$dir/"
   files=(prusa-connect-camera prusa-connect-camera.service remote.sh)
   if [[ $mode == install ]]; then
     printf '%s\n' "$token" >"$dir/token"
-    write_config "${name:-$host}" "$live" <"$repo/config.example.toml" >"$dir/config.toml"
+    write_config "${name:-$host}" "$live" "$sensor" <"$repo/config.example.toml" >"$dir/config.toml"
     files+=(token config.toml)
   fi
   (cd "$dir" && sha256sum -- "${files[@]}" >SHA256SUMS)
 }
 
-# Copies the example config from stdin to stdout with the camera's name set, and live view
-# turned on when LIVE is true.
+# Copies the example config from stdin to stdout with the camera's name set, live view turned
+# on when LIVE is true, and sizes that fit SENSOR. The config's defaults suit Camera Module v2.
 write_config() {
-  local value=$1 live=$2 line
+  local value=$1 live=$2 sensor=$3 line
+  local width="" height="" live_mode=""
+  # Camera Module 3 is 16:9. Its 2x2-binned mode sees the whole sensor, about as many pixels as
+  # the default snapshot size, while the v2's 4:3 sizes would cut off the sides.
+  if [[ $sensor == imx708* ]]; then
+    width=2304 height=1296 live_mode=2304:1296
+  fi
   value=${value//\\/\\\\}
   value=${value//\"/\\\"}
   while IFS= read -r line; do
@@ -184,6 +191,12 @@ write_config() {
       printf 'name = "%s"\n' "$value"
     elif [[ $line == '# live = false' ]] && $live; then
       printf 'live = true\n'
+    elif [[ $line == '# width = '* && -n $width ]]; then
+      printf 'width = %s\n' "$width"
+    elif [[ $line == '# height = '* && -n $height ]]; then
+      printf 'height = %s\n' "$height"
+    elif [[ $line == '# live_mode = '* && -n $live_mode ]]; then
+      printf 'live_mode = "%s"\n' "$live_mode"
     else
       printf '%s\n' "$line"
     fi
@@ -191,12 +204,18 @@ write_config() {
 }
 
 deploy_host() {
-  local host=$1 bundle=$work/bundle-$1 dir args status=0
+  local host=$1 bundle=$work/bundle-$1 dir args sensor status=0
   echo "==> $host: $mode"
 
-  remote "$host" bash -s -- "$mode" "$check_camera" <"$repo/deploy/preflight.sh" || return 1
+  remote "$host" bash -s -- "$mode" "$check_camera" <"$repo/deploy/preflight.sh" |
+    tee "$work/preflight-$host"
+  (( PIPESTATUS[0] == 0 )) || return 1
+  sensor=$(sed -n 's/.*, camera: \([^,]*\), service: .*/\1/p' "$work/preflight-$host")
+  if [[ $mode == install && $sensor != imx219* && $sensor != imx708* ]]; then
+    step "the config's sizes are tuned for Camera Module v2; check they fit this camera ($sensor)"
+  fi
 
-  make_bundle "$host" "$bundle"
+  make_bundle "$host" "$bundle" "$sensor"
   dir=$(remote "$host" mktemp -d) || return 1
   step "copying files"
   if tar -C "$bundle" -cf - . | remote "$host" tar -C "$dir" -xf -; then

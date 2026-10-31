@@ -85,6 +85,22 @@ pub struct RpicamConfig {
     pub extra_args: Vec<String>,
 }
 
+impl RpicamConfig {
+    /// The size of the sensor mode live view reads, which gives its streams their shape. Without
+    /// a `live_mode`, the snapshot size stands in.
+    pub fn live_sensor_size(&self) -> (u32, u32) {
+        parse_mode(&self.live_mode).unwrap_or((self.width, self.height))
+    }
+}
+
+/// Reads the width and height from a `WIDTH:HEIGHT[:…]` sensor mode.
+fn parse_mode(mode: &str) -> Option<(u32, u32)> {
+    let mut parts = mode.split(':');
+    let width = parts.next()?.parse().ok()?;
+    let height = parts.next()?.parse().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 impl Default for RpicamConfig {
     fn default() -> Self {
         Self {
@@ -177,6 +193,14 @@ impl Config {
                 ensure!(
                     rpicam.framerate > 0.0,
                     "camera {id}: framerate must be above 0"
+                );
+                ensure!(
+                    rpicam.width > 0 && rpicam.height > 0,
+                    "camera {id}: width and height must be above 0"
+                );
+                ensure!(
+                    rpicam.live_mode.is_empty() || parse_mode(&rpicam.live_mode).is_some(),
+                    "camera {id}: live_mode must be WIDTH:HEIGHT, e.g. \"1640:1232\""
                 );
             } else {
                 ensure!(
@@ -286,6 +310,29 @@ mod tests {
             (rpicam.width, rpicam.height, rpicam.quality),
             (2048, 1536, 50)
         );
+    }
+
+    #[test]
+    fn finds_the_live_sensor_size() {
+        let mut config = RpicamConfig::default();
+        assert_eq!(config.live_sensor_size(), (1640, 1232));
+        config.live_mode = "2304:1296:10:P".into();
+        assert_eq!(config.live_sensor_size(), (2304, 1296));
+        config.live_mode = String::new();
+        assert_eq!(config.live_sensor_size(), (2048, 1536));
+    }
+
+    #[test]
+    fn rejects_bad_live_modes() {
+        let camera = |mode: &str| {
+            parse(&format!(
+                "[[camera]]\nid = \"cam0\"\nsource = {{ type = \"rpicam\", live_mode = \"{mode}\" }}"
+            ))
+        };
+        assert!(camera("2304:1296").is_ok());
+        assert!(camera("").is_ok());
+        assert!(camera("2").is_err());
+        assert!(camera("0:1296").is_err());
     }
 
     #[test]
