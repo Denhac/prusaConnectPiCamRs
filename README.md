@@ -133,7 +133,9 @@ someone watches. Snapshots pause during that time and resume afterwards.
   the camera's whole view, with the shape of `live_mode`: 640x480, 1280x960 and 1640x1232 on a
   Camera Module v2, 640x360, 1280x720 and 1920x1080 on a Camera Module 3.
 - On a Pi 4 a stream costs about 8% of one core.
-- The viewer connects directly when it can: on the LAN, over Tailscale, or through NAT with
+- If the camera sends no video for a minute, the session ends rather than showing a frozen
+  picture, and the camera goes back to snapshots.
+- The viewer connects directly when it can: on the LAN, or through NAT with
   STUN. Otherwise the stream goes through Prusa's TURN relay, which Prusa limits to SD on free
   accounts.
 - The protocol is undocumented. It follows Prusa's webcam app (version 0.3.6) and may change.

@@ -185,13 +185,12 @@ pub fn run(config: &Config) -> Result<()> {
         .map(|c| Camera::open(config, c))
         .collect::<Result<_>>()?;
 
-    let mut live_threads = Vec::new();
-    for camera in &mut cameras {
-        if let Some(live_camera) = camera.live.take() {
-            let handle = live::spawn(config.signaling_url.clone(), live_camera)?;
-            live_threads.push((camera.id.clone(), handle));
-        }
-    }
+    let live_cameras: Vec<_> = cameras.iter_mut().filter_map(|c| c.live.take()).collect();
+    let live_thread = if live_cameras.is_empty() {
+        None
+    } else {
+        Some(live::spawn(config.signaling_url.clone(), live_cameras)?)
+    };
 
     let mut workers = Vec::new();
     for camera in cameras {
@@ -219,8 +218,11 @@ pub fn run(config: &Config) -> Result<()> {
                 bail!("camera {id}'s upload loop is stuck");
             }
         }
-        if let Some((id, _)) = live_threads.iter().find(|(_, handle)| handle.is_finished()) {
-            bail!("camera {id}'s live view crashed");
+        if live_thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            bail!("live view crashed");
         }
         if watchdog.is_some() {
             let _ = sd_notify::notify(&[NotifyState::Watchdog]);

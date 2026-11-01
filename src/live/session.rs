@@ -2,7 +2,7 @@
 //! the way Prusa's browser webcam does it. The camera makes the offer, both sides trickle ICE
 //! candidates through signaling, and a "ping-pong" data channel keeps the session alive.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,15 +17,16 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpEncodingParameters, RtpCodecKind,
 };
 use rtc::statistics::stats::ice_candidate_pair::RTCStatsIceCandidatePairState;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::media_stream::Track;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::peer_connection::{
     MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-    RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceCandidateType, RTCIceServer,
-    RTCIceTransportPolicy, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
+    RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceCandidateType, RTCIceGatheringState,
+    RTCIceServer, RTCIceTransportPolicy, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
     RTCSessionDescription, RTCStatsReportEntry, Registry, SettingEngineBuilder, StatsSelector,
     register_default_interceptors,
 };
@@ -41,6 +42,14 @@ const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-
 const DEFAULT_FPS: u32 = 12;
 /// Frame rate for relayed streams without video settings, as in Prusa's webcam.
 const RELAY_FPS: u32 = 10;
+/// A stream with no video for this long has failed. It leaves time for rpicam-vid's own stall
+/// restart to bring the camera back first.
+const VIDEO_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a closing session lets a relay allocation it has requested finish. One still in
+/// flight can't be released, so it would use up the viewer's relay quota until it expires.
+const ALLOCATION_WAIT: Duration = Duration::from_secs(3);
+/// How long a session waits for the attempts it replaces to finish releasing their allocations.
+const PREVIOUS_SESSION_WAIT: Duration = Duration::from_secs(5);
 /// How long a disconnected viewer has to come back.
 const RECONNECT_GRACE: Duration = Duration::from_secs(30);
 
@@ -60,12 +69,20 @@ pub enum Outgoing {
         local: ConnectionType,
         remote: ConnectionType,
     },
+    /// Whether a viewer is connected to session `serial` right now. Only a connected viewer
+    /// keeps others out.
+    Viewing {
+        request_id: String,
+        serial: u64,
+        viewing: bool,
+    },
     /// The stream couldn't start.
     Rejected {
         request_id: String,
     },
     Closed {
         request_id: String,
+        serial: u64,
     },
 }
 
@@ -78,6 +95,12 @@ pub enum Command {
 pub struct Session {
     pub camera_id: String,
     pub request_id: String,
+    /// Tells this session apart from others for the same request id.
+    pub serial: u64,
+    /// Attempts this session replaces.
+    pub previous: Vec<JoinHandle<()>>,
+    /// Held until the session has finished, so shutdown can wait for it.
+    pub _alive: mpsc::Sender<()>,
     pub request: proto::Webrtc,
     pub camera: Rpicam,
     /// The size of the sensor mode live view reads, which gives its streams their shape.
@@ -91,9 +114,18 @@ pub struct Session {
 /// stream stops.
 pub async fn run(mut session: Session) {
     let request_id = session.request_id.clone();
+    let serial = session.serial;
     let id = session.camera_id.clone();
     let out = session.out.clone();
     let mut connected = false;
+    for previous in session.previous.drain(..) {
+        let _ = tokio::time::timeout(PREVIOUS_SESSION_WAIT, previous).await;
+    }
+    // Replaced while waiting: don't request a relay allocation for a viewer that has moved on.
+    if session.commands.is_closed() {
+        let _ = out.send(Outgoing::Closed { request_id, serial }).await;
+        return;
+    }
     match serve(&mut session, &mut connected).await {
         Ok(reason) => log::info!("[{id}] live view ended: {reason}"),
         Err(e) => {
@@ -107,7 +139,7 @@ pub async fn run(mut session: Session) {
             }
         }
     }
-    let _ = out.send(Outgoing::Closed { request_id }).await;
+    let _ = out.send(Outgoing::Closed { request_id, serial }).await;
 }
 
 /// Hands the camera back to snapshots when a session ends, however it ends.
@@ -160,6 +192,7 @@ pub fn stream_for(
 }
 
 async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
+    let started = Instant::now();
     let ice = s.request.ice_configuration.clone().unwrap_or_default();
     let video = s.request.video_settings.clone();
     let relay_only = ice.ice_transport_policy() == IcePolicy::Relay;
@@ -215,14 +248,24 @@ async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
 
     let (states, mut state_changes) = mpsc::channel(16);
     let candidates = Arc::new(Mutex::new(Candidates::default()));
+    let (allocated, mut allocation_done) = watch::channel(false);
     let handler = Arc::new(Handler {
         request_id: s.request_id.clone(),
         out: s.out.clone(),
         states,
+        allocated,
         candidates: Arc::clone(&candidates),
     });
-    let addresses = host_addresses()?;
-    log::debug!("[{}] host candidates on {addresses:?}", s.camera_id);
+    for server in &ice.ice_servers {
+        // The part of a TURN username after the expiry time identifies whose quota it uses. The
+        // credential is never logged.
+        log::debug!(
+            "[{}] ICE server {:?}, TURN id {:?}",
+            s.camera_id,
+            proto::ice_urls(server),
+            server.username.rsplit(':').next().unwrap_or_default()
+        );
+    }
     let pc = PeerConnectionBuilder::new()
         .with_configuration(configuration)
         .with_media_engine(media_engine)
@@ -230,12 +273,7 @@ async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
         .with_setting_engine(settings)
         .with_handler(handler)
         .with_runtime(webrtc::runtime::default_runtime().context("no WebRTC runtime")?)
-        .with_udp_addrs(
-            addresses
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, 0))
-                .collect(),
-        )
+        .with_udp_addrs(vec![SocketAddr::new(local_ip()?, 0)])
         .build()
         .await?;
 
@@ -249,6 +287,8 @@ async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
         connected,
     )
     .await;
+    let remaining = ALLOCATION_WAIT.saturating_sub(started.elapsed());
+    let _ = tokio::time::timeout(remaining, allocation_done.wait_for(|done| *done)).await;
     let _ = pc.close().await;
     result
 }
@@ -327,7 +367,15 @@ async fn drive(
             Some(state) = state_changes.recv() => match state {
                 RTCPeerConnectionState::Connected => {
                     *connected = true;
+                    log::debug!("[{}] connected ({})", s.camera_id, candidates.lock().unwrap());
                     disconnected_deadline = None;
+                    s.out
+                        .send(Outgoing::Viewing {
+                            request_id: s.request_id.clone(),
+                            serial: s.serial,
+                            viewing: true,
+                        })
+                        .await?;
                     if media.is_none() {
                         let live = s.camera.start_live(stream);
                         _live = Some(LiveGuard { camera: s.camera.clone(), id: live.id });
@@ -365,9 +413,21 @@ async fn drive(
                     }
                 }
                 RTCPeerConnectionState::Disconnected => {
+                    s.out
+                        .send(Outgoing::Viewing {
+                            request_id: s.request_id.clone(),
+                            serial: s.serial,
+                            viewing: false,
+                        })
+                        .await?;
                     disconnected_deadline.get_or_insert(tokio::time::Instant::now() + RECONNECT_GRACE);
                 }
                 RTCPeerConnectionState::Failed => {
+                    // Once connected, this is how a viewer that simply went away usually looks.
+                    if *connected {
+                        log::debug!("[{}] lost the viewer ({})", s.camera_id, candidates.lock().unwrap());
+                        return Ok("the connection to the viewer was lost");
+                    }
                     bail!("the connection to the viewer failed ({})", candidates.lock().unwrap());
                 }
                 RTCPeerConnectionState::Closed => return Ok("the viewer closed the connection"),
@@ -409,7 +469,13 @@ async fn send_frames(
         .first()
         .context("the video track has no SSRC")?;
     let duration = Duration::from_secs(1) / framerate.max(1);
-    while let Some(data) = frames.recv().await {
+    loop {
+        let Ok(frame) = tokio::time::timeout(VIDEO_TIMEOUT, frames.recv()).await else {
+            bail!("the camera sent no video for {}s", VIDEO_TIMEOUT.as_secs());
+        };
+        let Some(data) = frame else {
+            return Ok(());
+        };
         track
             .sample_writer(ssrc, payload_type)
             .write_sample(&Sample {
@@ -419,7 +485,6 @@ async fn send_frames(
             })
             .await?;
     }
-    Ok(())
 }
 
 /// Answers the viewer's keep-alive messages, as Prusa's webcam does.
@@ -439,6 +504,8 @@ struct Handler {
     request_id: String,
     out: mpsc::Sender<Outgoing>,
     states: mpsc::Sender<RTCPeerConnectionState>,
+    /// Set once no relay allocation can still be in flight.
+    allocated: watch::Sender<bool>,
     candidates: Arc<Mutex<Candidates>>,
 }
 
@@ -489,11 +556,11 @@ impl PeerConnectionEventHandler for Handler {
         if init.candidate.is_empty() {
             return;
         }
-        self.candidates
-            .lock()
-            .unwrap()
-            .camera
-            .push(describe_candidate(&init.candidate));
+        let description = describe_candidate(&init.candidate);
+        if description.starts_with("relay ") {
+            let _ = self.allocated.send(true);
+        }
+        self.candidates.lock().unwrap().camera.push(description);
         // Prusa's webcam sends candidates in SDP attribute form.
         let candidate = if init.candidate.starts_with("a=") {
             init.candidate
@@ -508,6 +575,12 @@ impl PeerConnectionEventHandler for Handler {
                 mid: init.sdp_mid.unwrap_or_default(),
             })
             .await;
+    }
+
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        if state == RTCIceGatheringState::Complete {
+            let _ = self.allocated.send(true);
+        }
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
@@ -546,42 +619,8 @@ fn candidate_init(candidate: &str, mid: &str) -> RTCIceCandidateInit {
     }
 }
 
-/// The IPv4 addresses of every interface that is up, for host ICE candidates. Besides the LAN,
-/// this includes VPNs such as Tailscale, so a viewer on the same tailnet can connect directly.
-fn host_addresses() -> Result<Vec<IpAddr>> {
-    let mut addresses = Vec::new();
-    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills `list` with a linked list that is only read here and then
-    // released with freeifaddrs. Each ifa_addr is checked for null and for AF_INET before it is
-    // read as a sockaddr_in.
-    unsafe {
-        if libc::getifaddrs(&mut list) == 0 {
-            let mut entry = list;
-            while let Some(ifa) = entry.as_ref() {
-                let up = ifa.ifa_flags & libc::IFF_UP as u32 != 0;
-                let loopback = ifa.ifa_flags & libc::IFF_LOOPBACK as u32 != 0;
-                if up
-                    && !loopback
-                    && !ifa.ifa_addr.is_null()
-                    && i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET
-                {
-                    let addr = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    addresses.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
-                        addr.sin_addr.s_addr,
-                    ))));
-                }
-                entry = ifa.ifa_next;
-            }
-            libc::freeifaddrs(list);
-        }
-    }
-    if addresses.is_empty() {
-        addresses.push(local_ip()?);
-    }
-    Ok(addresses)
-}
-
-/// The address of the interface that routes to the internet.
+/// The address of the interface that routes to the internet, for the host ICE candidate. Viewers
+/// reach the camera over the internet or the LAN, never over a VPN such as Tailscale.
 fn local_ip() -> Result<IpAddr> {
     // Connecting a UDP socket sends nothing; it only selects the outgoing interface.
     let socket = UdpSocket::bind("0.0.0.0:0")?;

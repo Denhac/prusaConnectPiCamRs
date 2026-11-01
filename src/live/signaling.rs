@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use prost::Message;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use super::proto::{self, ClientType, MessageType, StreamStatus, Toggle, WebrtcMode, ack};
 use super::session::{self, Command, Outgoing, Session};
@@ -39,11 +40,22 @@ pub struct Camera {
 }
 
 /// Keeps the camera connected to signaling, reconnecting with backoff, forever.
-pub async fn run(url: String, camera: Camera) {
+/// Returns when `stopping` becomes true, which also ends the camera's sessions; `alive` is held
+/// until they have finished.
+pub async fn run(
+    url: String,
+    camera: Camera,
+    mut stopping: watch::Receiver<bool>,
+    alive: mpsc::Sender<()>,
+) {
     let mut delay = Duration::from_secs(1);
     loop {
         let started = Instant::now();
-        let error = match connection(&url, &camera).await {
+        let result = tokio::select! {
+            result = connection(&url, &camera, alive.clone()) => result,
+            _ = stopping.wait_for(|stop| *stop) => return,
+        };
+        let error = match result {
             Ok(()) => "disconnected".to_owned(),
             Err(e) => format!("{e:#}"),
         };
@@ -55,12 +67,15 @@ pub async fn run(url: String, camera: Camera) {
             camera.id,
             delay.as_secs()
         );
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = stopping.wait_for(|stop| *stop) => return,
+        }
         delay = (delay * 2).min(MAX_RECONNECT_DELAY);
     }
 }
 
-async fn connection(url: &str, camera: &Camera) -> Result<()> {
+async fn connection(url: &str, camera: &Camera, alive: mpsc::Sender<()>) -> Result<()> {
     let (mut reader, writer) = socketio::connect(url, ORIGIN, USER_AGENT).await?;
     let (out, mut outgoing) = mpsc::channel(64);
     let mut signaling = Signaling {
@@ -70,7 +85,9 @@ async fn connection(url: &str, camera: &Camera) -> Result<()> {
         awaiting: HashMap::new(),
         mode: WebrtcMode::On,
         sessions: HashMap::new(),
+        next_serial: 0,
         out,
+        alive,
         authenticated: false,
     };
     signaling.authenticate().await?;
@@ -87,6 +104,15 @@ async fn connection(url: &str, camera: &Camera) -> Result<()> {
     }
 }
 
+/// A running session, which may or may not have a viewer connected yet.
+struct Viewer {
+    serial: u64,
+    /// Dropping this ends the session.
+    commands: mpsc::Sender<Command>,
+    task: JoinHandle<()>,
+    viewing: bool,
+}
+
 struct Signaling<'a> {
     camera: &'a Camera,
     writer: Writer,
@@ -94,9 +120,11 @@ struct Signaling<'a> {
     /// Events awaiting the server's acknowledgement, by acknowledgement id.
     awaiting: HashMap<u64, &'static str>,
     mode: WebrtcMode,
-    /// Running viewer sessions by request id; dropping a sender ends its session.
-    sessions: HashMap<String, mpsc::Sender<Command>>,
+    /// Running sessions by request id.
+    sessions: HashMap<String, Viewer>,
+    next_serial: u64,
     out: mpsc::Sender<Outgoing>,
+    alive: mpsc::Sender<()>,
     authenticated: bool,
 }
 
@@ -248,7 +276,12 @@ impl Signaling<'_> {
 
     async fn start_session(&mut self, request: proto::Webrtc) -> Result<()> {
         let request_id = request.request_id.clone();
-        let full = self.sessions.len() >= MAX_VIEWERS && !self.sessions.contains_key(&request_id);
+        let full = another_viewer_watching(
+            self.sessions
+                .iter()
+                .map(|(id, viewer)| (id.as_str(), viewer.viewing)),
+            &request_id,
+        );
         if self.mode == WebrtcMode::Off || full {
             log::info!(
                 "[{}] declining a live view request: {}",
@@ -261,23 +294,44 @@ impl Signaling<'_> {
             );
             return self.reject(request_id).await;
         }
+        // Attempts without a viewer, and any earlier session for this same request, give way.
+        // Dropping them ends them; the new session waits so their allocations are released first.
+        let (replaced, kept): (HashMap<_, _>, HashMap<_, _>) = std::mem::take(&mut self.sessions)
+            .into_iter()
+            .partition(|(id, viewer)| !viewer.viewing || *id == request_id);
+        self.sessions = kept;
+        let previous = replaced.into_values().map(|viewer| viewer.task).collect();
+
+        let serial = self.next_serial;
+        self.next_serial += 1;
         let (commands, receiver) = mpsc::channel(32);
-        self.sessions.insert(request_id.clone(), commands);
-        tokio::spawn(session::run(Session {
+        let task = tokio::spawn(session::run(Session {
             camera_id: self.camera.id.clone(),
-            request_id,
+            request_id: request_id.clone(),
+            serial,
+            previous,
+            _alive: self.alive.clone(),
             request,
             camera: self.camera.source.clone(),
             sensor_size: self.camera.sensor_size,
             out: self.out.clone(),
             commands: receiver,
         }));
+        self.sessions.insert(
+            request_id,
+            Viewer {
+                serial,
+                commands,
+                task,
+                viewing: false,
+            },
+        );
         Ok(())
     }
 
     async fn forward(&self, request_id: &str, command: Command) {
         if let Some(session) = self.sessions.get(request_id) {
-            let _ = session.send(command).await;
+            let _ = session.commands.send(command).await;
         }
     }
 
@@ -332,12 +386,24 @@ impl Signaling<'_> {
                 };
                 self.emit("webrtc_connection_info", message).await
             }
+            Outgoing::Viewing {
+                request_id,
+                serial,
+                viewing,
+            } => {
+                if let Some(viewer) = self.sessions.get_mut(&request_id)
+                    && viewer.serial == serial
+                {
+                    viewer.viewing = viewing;
+                }
+                Ok(())
+            }
             Outgoing::Rejected { request_id } => self.reject(request_id).await,
-            Outgoing::Closed { request_id } => {
+            Outgoing::Closed { request_id, serial } => {
                 if self
                     .sessions
                     .get(&request_id)
-                    .is_some_and(|s| s.is_closed())
+                    .is_some_and(|viewer| viewer.serial == serial)
                 {
                     self.sessions.remove(&request_id);
                 }
@@ -403,6 +469,18 @@ impl Signaling<'_> {
     }
 }
 
+/// Whether connected viewers leave no room for a new request. An attempt that hasn't connected
+/// doesn't count, nor does a viewer asking again for its own request.
+fn another_viewer_watching<'a>(
+    sessions: impl Iterator<Item = (&'a str, bool)>,
+    request_id: &str,
+) -> bool {
+    sessions
+        .filter(|&(id, viewing)| viewing && id != request_id)
+        .count()
+        >= MAX_VIEWERS
+}
+
 /// The board's model, reported to Prusa Connect as the camera's hardware.
 pub fn hardware() -> String {
     std::fs::read_to_string("/proc/device-tree/model")
@@ -410,4 +488,20 @@ pub fn hardware() -> String {
         .ok()
         .filter(|model| !model.is_empty())
         .unwrap_or_else(|| "Raspberry Pi".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_connected_viewer_blocks_a_new_request() {
+        let blocks = |sessions: &[(&'static str, bool)], id| {
+            another_viewer_watching(sessions.iter().copied(), id)
+        };
+        assert!(!blocks(&[], "new"));
+        assert!(!blocks(&[("dead attempt", false)], "new"));
+        assert!(blocks(&[("watching", true)], "new"));
+        assert!(!blocks(&[("watching", true)], "watching"));
+    }
 }

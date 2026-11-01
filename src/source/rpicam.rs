@@ -22,6 +22,10 @@ use crate::config::RpicamConfig;
 /// Frames skipped after rpicam-vid starts, while auto exposure and white balance settle.
 const SETTLE_FRAMES: u64 = 3;
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
+/// How long rpicam-vid may run without producing a frame before it's restarted. It can stay
+/// alive without output, for example retrying a camera that times out or with a stuck encoder.
+const MIN_STALL_LIMIT: Duration = Duration::from_secs(30);
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Live frames buffered for a viewer that falls behind; beyond this, frames are dropped.
 const LIVE_QUEUE: usize = 30;
 
@@ -60,6 +64,10 @@ struct State {
     generation: u64,
     /// The running rpicam-vid process.
     pid: Option<u32>,
+    /// When the running process started or last produced a frame.
+    last_frame: Option<Instant>,
+    /// How long the running process may go without producing a frame.
+    stall_limit: Duration,
 }
 
 struct Live {
@@ -87,6 +95,11 @@ impl Rpicam {
             .name(format!("rpicam-{}", config.index))
             .spawn(move || supervise(&config, &thread_shared))
             .context("starting the rpicam-vid thread")?;
+        let thread_shared = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("rpicam-watchdog".into())
+            .spawn(move || restart_when_stalled(&thread_shared))
+            .context("starting the rpicam-vid watchdog thread")?;
         Ok(Self { shared })
     }
 
@@ -217,24 +230,62 @@ fn args(config: &RpicamConfig, mode: &[&str]) -> Vec<String> {
     args
 }
 
+/// How long a process streaming at `framerate` may go without a frame. Long enough for very low
+/// frame rates, and for rpicam-vid to start and produce its first frame.
+fn stall_limit(framerate: f32) -> Duration {
+    MIN_STALL_LIMIT.max(Duration::from_secs_f32(3.0 / framerate))
+}
+
+/// Kills an rpicam-vid that's still running but has stopped producing frames. [`supervise`] then
+/// starts a new one, which rebuilds everything a process owns: libcamera's state, the encoder and
+/// its device handles. A hardware fault still needs a person; the log at least says so.
+fn restart_when_stalled(shared: &Shared) {
+    loop {
+        thread::sleep(STALL_CHECK_INTERVAL);
+        let mut state = shared.state.lock().unwrap();
+        let (Some(pid), Some(last_frame)) = (state.pid, state.last_frame) else {
+            continue;
+        };
+        if last_frame.elapsed() > state.stall_limit {
+            let error = format!(
+                "rpicam-vid is running but sent no frames for {}s; check the camera and its cable",
+                state.stall_limit.as_secs()
+            );
+            log::warn!("{error}");
+            state.last_error = Some(error);
+            state.last_frame = Some(Instant::now());
+            // SAFETY: kill only sends a signal. `pid` is our child, cleared under the state lock
+            // before the child is reaped, so it can't refer to a reused process id. SIGKILL
+            // because a stalled process may not get as far as handling SIGTERM.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+}
+
 /// Runs rpicam-vid for as long as the program runs, restarting it when it stops or when the
 /// camera switches between snapshots and live view.
 fn supervise(config: &RpicamConfig, shared: &Shared) {
     let mut delay = Duration::from_secs(1);
     loop {
-        let (generation, args, frames) = {
+        let (generation, args, frames, limit) = {
             let state = shared.state.lock().unwrap();
             match &state.live {
                 Some(live) => (
                     state.generation,
                     live_args(config, live.stream),
                     Some(live.frames.clone()),
+                    stall_limit(live.stream.framerate as f32),
                 ),
-                None => (state.generation, snapshot_args(config), None),
+                None => (
+                    state.generation,
+                    snapshot_args(config),
+                    None,
+                    stall_limit(config.framerate),
+                ),
             }
         };
         let started = Instant::now();
-        let result = stream(&config.command, &args, shared, generation, frames);
+        let result = stream(&config.command, &args, shared, generation, frames, limit);
         let switched = {
             let mut state = shared.state.lock().unwrap();
             state.since_start = 0;
@@ -266,6 +317,7 @@ fn stream(
     shared: &Shared,
     generation: u64,
     live: Option<mpsc::Sender<Bytes>>,
+    stall_limit: Duration,
 ) -> Result<ExitStatus> {
     let mut cmd = Command::new(command);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped());
@@ -285,6 +337,8 @@ fn stream(
     {
         let mut state = shared.state.lock().unwrap();
         state.pid = Some(child.id());
+        state.last_frame = Some(Instant::now());
+        state.stall_limit = stall_limit;
         // The mode changed while this process was starting, so it's already out of date.
         if state.generation != generation {
             let _ = child.kill();
@@ -318,6 +372,8 @@ fn read_snapshots(mut stdout: impl Read, shared: &Shared) -> Result<()> {
             state.seq += 1;
             state.since_start += 1;
             state.latest = Some(frame.into());
+            state.last_frame = Some(Instant::now());
+            state.last_error = None;
             shared.new_frame.notify_all();
         }
     }
@@ -332,6 +388,7 @@ fn read_live(mut stdout: impl Read, shared: &Shared, frames: &mpsc::Sender<Bytes
             return Ok(());
         }
         for unit in units.push(&buf[..n]) {
+            shared.state.lock().unwrap().last_frame = Some(Instant::now());
             match frames.try_send(Bytes::from(unit)) {
                 // A viewer that falls behind loses frames; the next keyframe recovers it.
                 Ok(()) | Err(TrySendError::Full(_)) => {}
@@ -378,6 +435,13 @@ mod tests {
             extra_args: vec!["--denoise".into(), "cdn_off".into()],
             ..RpicamConfig::default()
         }
+    }
+
+    #[test]
+    fn allows_several_frames_before_calling_a_stall() {
+        assert_eq!(stall_limit(1.0), MIN_STALL_LIMIT);
+        assert_eq!(stall_limit(12.0), MIN_STALL_LIMIT);
+        assert_eq!(stall_limit(0.05), Duration::from_secs(60));
     }
 
     #[test]
