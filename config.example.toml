@@ -55,11 +55,13 @@ type = "rpicam"
 #   height = 480
 #   framerate = 15         # must be a capture mode supported by the webcam
 #   input_format = "mjpeg" # copies camera JPEGs; use "yuyv422" for a raw-only webcam
+#   live_encoder = "libx264" # software default; "h264_v4l2m2m" for Pi hardware encoding
 #   command = "ffmpeg"
 # Install: sudo apt install ffmpeg v4l-utils
 # Find cameras: v4l2-ctl --list-devices
 # Find modes: v4l2-ctl --device /dev/video0 --list-formats-ext
-# USB live view uses software H.264 encoding. Start with live = false on a Pi 2.
+# MJPEG live view drains capture continuously and encodes only recent frames. Hardware
+# encoding is recommended on older Pis when /dev/video11 and h264_v4l2m2m are available.
 
 # A second camera, e.g. on a Pi 5 or Compute Module with two camera ports:
 # [[camera]]

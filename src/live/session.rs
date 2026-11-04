@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use bytes::Bytes;
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
@@ -32,7 +31,7 @@ use webrtc::rtp_transceiver::RtpSender;
 
 use super::proto::{self, ApplyScope, ConnectionType, IcePolicy, VideoQuality};
 use crate::config::LiveQuality;
-use crate::source::process::{CameraSource, LiveStream};
+use crate::source::process::{CameraSource, LiveFrame, LiveStream};
 
 const PAYLOAD_TYPE: u8 = 102;
 /// The profile Prusa Connect's viewers accept; the camera's SPS is patched to match.
@@ -474,7 +473,7 @@ async fn drive(
 async fn send_frames(
     track: Arc<TrackLocalStaticSample>,
     sender: Arc<dyn RtpSender>,
-    mut frames: mpsc::Receiver<Bytes>,
+    mut frames: mpsc::Receiver<LiveFrame>,
     framerate: u32,
 ) -> Result<()> {
     let payload_type = sender
@@ -490,22 +489,55 @@ async fn send_frames(
         .await
         .first()
         .context("the video track has no SSRC")?;
-    let duration = Duration::from_secs(1) / framerate.max(1);
+    let mut clock = LiveClock::new(framerate);
+    let mut recovering = false;
     loop {
         let Ok(frame) = tokio::time::timeout(VIDEO_TIMEOUT, frames.recv()).await else {
             bail!("the camera sent no video for {}s", VIDEO_TIMEOUT.as_secs());
         };
-        let Some(data) = frame else {
+        let Some(frame) = frame else {
             return Ok(());
         };
+        if frame.produced_at.elapsed() > Duration::from_millis(500) {
+            recovering = true;
+            continue;
+        }
+        if recovering && !frame.keyframe {
+            continue;
+        }
+        recovering = false;
+        let duration = clock.duration(frame.produced_at);
         track
             .sample_writer(ssrc, payload_type)
             .write_sample(&Sample {
-                data,
+                data: frame.data,
                 duration,
-                ..Sample::new(Instant::now())
+                ..Sample::new(frame.produced_at)
             })
             .await?;
+    }
+}
+
+/// RTP time follows real frame production, even when encoding cannot meet the requested FPS.
+struct LiveClock {
+    previous: Option<Instant>,
+    nominal: Duration,
+}
+
+impl LiveClock {
+    fn new(fps: u32) -> Self {
+        Self {
+            previous: None,
+            nominal: Duration::from_secs_f64(1.0 / fps.max(1) as f64),
+        }
+    }
+
+    fn duration(&mut self, now: Instant) -> Duration {
+        let duration = self.previous.map_or(self.nominal, |previous| {
+            now.saturating_duration_since(previous)
+        });
+        self.previous = Some(now);
+        duration.max(Duration::from_micros(1))
     }
 }
 
@@ -721,6 +753,23 @@ mod tests {
 
     const MODULE_2: (u32, u32) = (1640, 1232);
     const MODULE_3: (u32, u32) = (2304, 1296);
+
+    #[test]
+    fn live_clock_tracks_slow_frames_and_skipped_video_in_real_time() {
+        let start = Instant::now();
+        let mut clock = LiveClock::new(12);
+        assert_eq!(clock.duration(start), Duration::from_secs_f64(1.0 / 12.0));
+        for seconds in 1..=60 {
+            assert_eq!(
+                clock.duration(start + Duration::from_secs(seconds)),
+                Duration::from_secs(1)
+            );
+        }
+        assert_eq!(
+            clock.duration(start + Duration::from_secs(65)),
+            Duration::from_secs(5)
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires local UDP sockets; run with cargo test detects_local_video_route -- --ignored"]

@@ -3,9 +3,9 @@
 //! for them instead, and snapshots pause. Unlike starting a process for each snapshot, the
 //! camera keeps running, so exposure and white balance stay settled between uploads.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
 const MIN_STALL_LIMIT: Duration = Duration::from_secs(30);
 const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Live frames buffered for a viewer that falls behind; beyond this, frames are dropped.
-const LIVE_QUEUE: usize = 30;
+const LIVE_QUEUE: usize = 3;
 
 /// An H.264 stream for live view.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,6 +38,13 @@ pub struct LiveStream {
     pub framerate: u32,
     /// Bits per second.
     pub bitrate: u32,
+}
+
+/// Encoded media with its actual production time, independent of the requested frame rate.
+pub struct LiveFrame {
+    pub data: Bytes,
+    pub produced_at: Instant,
+    pub keyframe: bool,
 }
 
 #[derive(Clone)]
@@ -64,7 +71,7 @@ struct State {
     /// Bumped on every switch between snapshots and live view.
     generation: u64,
     /// The running camera process.
-    pid: Option<u32>,
+    pids: Vec<u32>,
     /// When the running process started or last produced a frame.
     last_frame: Option<Instant>,
     /// How long the running process may go without producing a frame.
@@ -75,13 +82,13 @@ struct Live {
     /// The generation that started this stream.
     id: u64,
     stream: LiveStream,
-    frames: mpsc::Sender<Bytes>,
+    frames: mpsc::Sender<LiveFrame>,
 }
 
 /// A live stream's frames, one access unit each, and the id that stops it.
 pub struct LiveFrames {
     pub id: u64,
-    pub frames: mpsc::Receiver<Bytes>,
+    pub frames: mpsc::Receiver<LiveFrame>,
 }
 
 impl CameraSource {
@@ -128,11 +135,15 @@ impl CameraSource {
 impl Shared {
     /// Changes what camera process streams and returns the new generation. The running process is
     /// stopped and the supervisor starts it again in the new mode.
-    fn switch(&self, state: &mut State, live: Option<(LiveStream, mpsc::Sender<Bytes>)>) -> u64 {
+    fn switch(
+        &self,
+        state: &mut State,
+        live: Option<(LiveStream, mpsc::Sender<LiveFrame>)>,
+    ) -> u64 {
         state.generation += 1;
         let id = state.generation;
         state.live = live.map(|(stream, frames)| Live { id, stream, frames });
-        if let Some(pid) = state.pid {
+        for &pid in &state.pids {
             // SAFETY: kill only sends a signal. `pid` is our child, cleared under the state lock
             // before the child is reaped, so it can't refer to a reused process id.
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
@@ -179,10 +190,10 @@ fn restart_when_stalled(shared: &Shared) {
     loop {
         thread::sleep(STALL_CHECK_INTERVAL);
         let mut state = shared.state.lock().unwrap();
-        let (Some(pid), Some(last_frame)) = (state.pid, state.last_frame) else {
+        let Some(last_frame) = state.last_frame else {
             continue;
         };
-        if last_frame.elapsed() > state.stall_limit {
+        if !state.pids.is_empty() && last_frame.elapsed() > state.stall_limit {
             let error = format!(
                 "camera process is running but sent no frames for {}s; check the camera and its cable",
                 state.stall_limit.as_secs()
@@ -193,7 +204,9 @@ fn restart_when_stalled(shared: &Shared) {
             // SAFETY: kill only sends a signal. `pid` is our child, cleared under the state lock
             // before the child is reaped, so it can't refer to a reused process id. SIGKILL
             // because a stalled process may not get as far as handling SIGTERM.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            for &pid in &state.pids {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            }
         }
     }
 }
@@ -203,7 +216,7 @@ fn restart_when_stalled(shared: &Shared) {
 fn supervise(config: &SourceConfig, shared: &Shared) {
     let mut delay = Duration::from_secs(1);
     loop {
-        let (generation, args, frames, limit) = {
+        let (generation, args, frames, limit, live_stream) = {
             let state = shared.state.lock().unwrap();
             match &state.live {
                 Some(live) => (
@@ -211,17 +224,24 @@ fn supervise(config: &SourceConfig, shared: &Shared) {
                     live_args(config, live.stream),
                     Some(live.frames.clone()),
                     stall_limit(live.stream.framerate as f32),
+                    Some(live.stream),
                 ),
                 None => (
                     state.generation,
                     snapshot_args(config),
                     None,
                     stall_limit(framerate(config)),
+                    None,
                 ),
             }
         };
         let started = Instant::now();
-        let result = stream(command(config), &args, shared, generation, frames, limit);
+        let result = match (config, live_stream, frames) {
+            (SourceConfig::Usb(c), Some(live), Some(frames)) if c.input_format == "mjpeg" => {
+                stream_usb_live(c, live, shared, generation, &frames, limit)
+            }
+            (_, _, frames) => stream(command(config), &args, shared, generation, frames, limit),
+        };
         let switched = {
             let mut state = shared.state.lock().unwrap();
             state.since_start = 0;
@@ -252,11 +272,77 @@ fn stream(
     args: &[String],
     shared: &Shared,
     generation: u64,
-    live: Option<mpsc::Sender<Bytes>>,
+    live: Option<mpsc::Sender<LiveFrame>>,
     stall_limit: Duration,
 ) -> Result<ExitStatus> {
+    let mut child = spawn_child(
+        command,
+        args,
+        Stdio::null(),
+        shared,
+        generation,
+        stall_limit,
+    )?;
+    let stdout = child
+        .child
+        .as_mut()
+        .unwrap()
+        .stdout
+        .take()
+        .expect("stdout is piped");
+    let result = match live {
+        Some(frames) => read_live(stdout, shared, &frames),
+        None => read_snapshots(stdout, shared),
+    };
+    let status = child.finish()?;
+    result.map(|()| status)
+}
+
+/// Keeps every child registered until it is killed and about to be reaped. Both members of
+/// the USB capture/encoder pipeline must stop on mode changes, stalls and error paths.
+struct CameraChild<'a> {
+    child: Option<Child>,
+    shared: &'a Shared,
+}
+
+impl CameraChild<'_> {
+    fn kill(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+        }
+    }
+
+    fn finish(&mut self) -> Result<ExitStatus> {
+        let mut child = self.child.take().expect("child not yet reaped");
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .pids
+            .retain(|&pid| pid != child.id());
+        let _ = child.kill();
+        child.wait().context("waiting for camera subprocess")
+    }
+}
+
+impl Drop for CameraChild<'_> {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            let _ = self.finish();
+        }
+    }
+}
+
+fn spawn_child<'a>(
+    command: &str,
+    args: &[String],
+    stdin: Stdio,
+    shared: &'a Shared,
+    generation: u64,
+    stall_limit: Duration,
+) -> Result<CameraChild<'a>> {
     let mut cmd = Command::new(command);
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped());
+    cmd.args(args).stdin(stdin).stdout(Stdio::piped());
     // Have the kernel stop camera process when the thread that started it ends, so it never keeps
     // holding the camera after this program exits or is killed.
     // SAFETY: prctl is async-signal-safe and touches no memory shared with the parent.
@@ -272,7 +358,7 @@ fn stream(
     log::info!("started {command} {}", args.join(" "));
     {
         let mut state = shared.state.lock().unwrap();
-        state.pid = Some(child.id());
+        state.pids.push(child.id());
         state.last_frame = Some(Instant::now());
         state.stall_limit = stall_limit;
         // The mode changed while this process was starting, so it's already out of date.
@@ -281,18 +367,142 @@ fn stream(
         }
     }
 
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let result = match live {
-        Some(frames) => read_live(stdout, shared, &frames),
-        None => read_snapshots(stdout, shared),
-    };
-    shared.state.lock().unwrap().pid = None;
-    // Usually a no-op: the stream ends because camera process exited.
-    let _ = child.kill();
-    let status = child
-        .wait()
-        .with_context(|| format!("waiting for {command}"))?;
+    Ok(CameraChild {
+        child: Some(child),
+        shared,
+    })
+}
+
+/// Capture compressed JPEGs continuously, replacing the previous one. Encoder backpressure
+/// blocks only the feeder, never webcam draining. The next encode always gets the newest JPEG.
+fn stream_usb_live(
+    config: &crate::config::UsbConfig,
+    live: LiveStream,
+    shared: &Shared,
+    generation: u64,
+    frames: &mpsc::Sender<LiveFrame>,
+    limit: Duration,
+) -> Result<ExitStatus> {
+    let mut capture = spawn_child(
+        &config.command,
+        &usb::snapshot_args(config),
+        Stdio::null(),
+        shared,
+        generation,
+        limit,
+    )?;
+    let mut encoder = spawn_child(
+        &config.command,
+        &usb::pipe_live_args(config, live),
+        Stdio::piped(),
+        shared,
+        generation,
+        limit,
+    )?;
+    let input = capture.child.as_mut().unwrap().stdout.take().unwrap();
+    let output = encoder.child.as_mut().unwrap().stdout.take().unwrap();
+    let stdin = encoder.child.as_mut().unwrap().stdin.take().unwrap();
+    let latest = LatestJpeg::default();
+    let result = thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let result = drain_jpegs(input, &latest);
+            latest.close();
+            result
+        });
+        let writer = scope.spawn(|| feed_jpegs(stdin, &latest, live.framerate));
+        let result = read_live(output, shared, frames);
+        // Unblock both pipe workers before joining them, including a stalled stdin write.
+        latest.close();
+        capture.kill();
+        encoder.kill();
+        let read_result = reader.join().expect("JPEG reader panicked");
+        let _ = writer.join().expect("JPEG feeder panicked");
+        result.and(read_result)
+    });
+    let _ = capture.finish();
+    let status = encoder.finish()?;
     result.map(|()| status)
+}
+
+#[derive(Default)]
+struct LatestJpeg {
+    state: Mutex<JpegState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct JpegState {
+    seq: u64,
+    latest: Option<Vec<u8>>,
+    closed: bool,
+}
+
+impl LatestJpeg {
+    fn push(&self, frame: Vec<u8>) {
+        let mut state = self.state.lock().unwrap();
+        state.seq += 1;
+        state.latest = Some(frame);
+        self.changed.notify_one();
+    }
+
+    fn after(&self, seq: u64) -> Option<(u64, Vec<u8>)> {
+        let state = self.state.lock().unwrap();
+        let state = self
+            .changed
+            .wait_while(state, |s| s.seq <= seq && !s.closed)
+            .unwrap();
+        if state.closed {
+            return None;
+        }
+        Some((state.seq, state.latest.as_ref().unwrap().clone()))
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.changed.notify_all();
+    }
+}
+
+fn drain_jpegs(mut input: impl Read, latest: &LatestJpeg) -> Result<()> {
+    let mut splitter = Splitter::default();
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        let n = input.read(&mut buf).context("reading USB MJPEG capture")?;
+        if n == 0 {
+            return Ok(());
+        }
+        for frame in splitter.push(&buf[..n]) {
+            latest.push(frame);
+        }
+    }
+}
+
+fn feed_jpegs(mut output: impl Write, latest: &LatestJpeg, fps: u32) -> Result<()> {
+    let interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+    let mut seq = 0;
+    let mut next = Instant::now();
+    loop {
+        // Wake on close as well as pacing. Never carry a selected frame across the wait.
+        let state = latest.state.lock().unwrap();
+        let (state, _) = latest
+            .changed
+            .wait_timeout_while(state, next.saturating_duration_since(Instant::now()), |s| {
+                !s.closed
+            })
+            .unwrap();
+        if state.closed {
+            return Ok(());
+        }
+        drop(state);
+        let Some((new_seq, jpeg)) = latest.after(seq) else {
+            return Ok(());
+        };
+        seq = new_seq;
+        output
+            .write_all(&jpeg)
+            .context("feeding newest JPEG to H.264 encoder")?;
+        next = Instant::now() + interval;
+    }
 }
 
 fn read_snapshots(mut stdout: impl Read, shared: &Shared) -> Result<()> {
@@ -317,9 +527,14 @@ fn read_snapshots(mut stdout: impl Read, shared: &Shared) -> Result<()> {
     }
 }
 
-fn read_live(mut stdout: impl Read, shared: &Shared, frames: &mpsc::Sender<Bytes>) -> Result<()> {
+fn read_live(
+    mut stdout: impl Read,
+    shared: &Shared,
+    frames: &mpsc::Sender<LiveFrame>,
+) -> Result<()> {
     let mut units = AccessUnits::default();
     let mut buf = vec![0; 64 * 1024];
+    let mut recovering = false;
     loop {
         let n = stdout
             .read(&mut buf)
@@ -329,9 +544,18 @@ fn read_live(mut stdout: impl Read, shared: &Shared, frames: &mpsc::Sender<Bytes
         }
         for unit in units.push(&buf[..n]) {
             shared.state.lock().unwrap().last_frame = Some(Instant::now());
-            match frames.try_send(Bytes::from(unit)) {
-                // A viewer that falls behind loses frames; the next keyframe recovers it.
-                Ok(()) | Err(TrySendError::Full(_)) => {}
+            let keyframe = is_keyframe(&unit);
+            if recovering && !keyframe {
+                continue;
+            }
+            match frames.try_send(LiveFrame {
+                data: Bytes::from(unit),
+                produced_at: Instant::now(),
+                keyframe,
+            }) {
+                Ok(()) => recovering = false,
+                // Never send dependent frames after losing one; recover at an IDR.
+                Err(TrySendError::Full(_)) => recovering = true,
                 Err(TrySendError::Closed(_)) => {
                     // The viewer is gone without stopping live view; go back to snapshots,
                     // unless another viewer's stream has taken over.
@@ -348,6 +572,11 @@ fn read_live(mut stdout: impl Read, shared: &Shared, frames: &mpsc::Sender<Bytes
             }
         }
     }
+}
+
+fn is_keyframe(unit: &[u8]) -> bool {
+    unit.windows(4)
+        .any(|w| w[..3] == [0, 0, 1] && w[3] & 0x1f == 5)
 }
 
 fn command(config: &SourceConfig) -> &str {
@@ -393,6 +622,132 @@ fn live_args(config: &SourceConfig, stream: LiveStream) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and local executable fixtures; run with cargo test usb_live_pipeline -- --ignored"]
+    async fn usb_live_pipeline_streams_and_reaps_both_children() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("prusa-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let script = dir.join("ffmpeg-test");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$*" in
+  *v4l2*) exec ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -c:v mjpeg -threads 1 -f mjpeg pipe:1 ;;
+  *) exec ffmpeg -re "$@" ;;
+esac
+"#,
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+        let config = crate::config::UsbConfig {
+            command: script.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let shared = Arc::new(Shared {
+            state: Mutex::default(),
+            new_frame: Condvar::new(),
+        });
+        let (sender, mut frames) = mpsc::channel(LIVE_QUEUE);
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            stream_usb_live(
+                &config,
+                LiveStream {
+                    width: 640,
+                    height: 480,
+                    framerate: 12,
+                    bitrate: 900_000,
+                },
+                &worker_shared,
+                0,
+                &sender,
+                MIN_STALL_LIMIT,
+            )
+        });
+        let result = async {
+            for _ in 0..4 {
+                let frame = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+                    .await?
+                    .context("pipeline ended before four frames")?;
+                assert!(frame.keyframe);
+                assert!(frame.produced_at.elapsed() < Duration::from_millis(500));
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        drop(frames);
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.generation += 1;
+            for &pid in &state.pids {
+                // SAFETY: registered child PIDs cannot be reaped while this lock is held.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+        let _ = worker.join().expect("pipeline worker panicked");
+        assert!(shared.state.lock().unwrap().pids.is_empty());
+        std::fs::remove_dir_all(&dir)?;
+        result
+    }
+
+    #[test]
+    fn slow_encoder_gets_newest_jpeg_instead_of_a_backlog() {
+        use std::sync::mpsc;
+        struct SlowWriter {
+            sent: mpsc::Sender<Vec<u8>>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl Write for SlowWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.sent.send(bytes.to_vec()).unwrap();
+                self.resume.recv().unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let latest = Arc::new(LatestJpeg::default());
+        latest.push(vec![1]);
+        let (sent, observed) = mpsc::channel();
+        let (resume, stalled) = mpsc::channel();
+        let worker_latest = Arc::clone(&latest);
+        let worker = thread::spawn(move || {
+            feed_jpegs(
+                SlowWriter {
+                    sent,
+                    resume: stalled,
+                },
+                &worker_latest,
+                1000,
+            )
+        });
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            vec![1]
+        );
+        // Camera drains another hundred frames while encoder input is blocked.
+        for n in 2..=100 {
+            latest.push(vec![n]);
+        }
+        resume.send(()).unwrap();
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            vec![100]
+        );
+        latest.close();
+        resume.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(latest.after(0).is_none());
+    }
+
+    #[test]
+    fn identifies_keyframes_for_safe_video_dropping() {
+        assert!(is_keyframe(&[0, 0, 0, 1, 0x65, 0x88]));
+        assert!(is_keyframe(&[0, 0, 1, 0x25, 0x88]));
+        assert!(!is_keyframe(&[0, 0, 0, 1, 0x41, 0x88]));
+    }
 
     #[test]
     fn allows_several_frames_before_calling_a_stall() {

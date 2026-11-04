@@ -48,27 +48,113 @@ pub(super) fn snapshot_args(config: &UsbConfig) -> Vec<String> {
 
 pub(super) fn live_args(config: &UsbConfig, stream: LiveStream) -> Vec<String> {
     let mut args = input_args(config);
-    // Match the existing live-view parser: Annex B, access-unit delimiters, repeated SPS/PPS
-    // and a keyframe every second. libx264 is portable but can be costly on older Pis.
-    #[rustfmt::skip]
+    args.extend(encode_args(config, stream, false));
+    args
+}
+
+/// A one-packet input queue and single-threaded decode bound encoder read-ahead. Capture
+/// happens separately, so a slow encoder gets recent JPEGs instead of blocking the webcam.
+pub(super) fn pipe_live_args(config: &UsbConfig, stream: LiveStream) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-nostdin",
+        "-thread_queue_size",
+        "1",
+        "-f",
+        "image2pipe",
+        "-c:v",
+        "mjpeg",
+        "-probesize",
+        "32",
+        "-analyzeduration",
+        "0",
+        "-threads",
+        "1",
+    ]
+    .map(String::from)
+    .into();
     args.extend([
-        "-vf".into(), format!("fps={},scale={}:{}", stream.framerate, stream.width, stream.height),
-        "-c:v".into(), "libx264".into(),
-        "-preset".into(), "ultrafast".into(),
-        "-tune".into(), "zerolatency".into(),
-        "-pix_fmt".into(), "yuv420p".into(),
-        "-profile:v".into(), "baseline".into(),
-        "-level:v".into(), "4.1".into(),
-        "-b:v".into(), stream.bitrate.to_string(),
-        "-g".into(), stream.framerate.to_string(),
-        "-x264-params".into(), "repeat-headers=1:aud=1:scenecut=0".into(),
-        "-f".into(), "h264".into(),
-        "-flush_packets".into(), "1".into(),
+        "-framerate".into(),
+        stream.framerate.to_string(),
+        "-i".into(),
+        "pipe:0".into(),
+        "-an".into(),
+    ]);
+    args.extend(encode_args(config, stream, true));
+    args
+}
+
+fn encode_args(config: &UsbConfig, stream: LiveStream, latest_only: bool) -> Vec<String> {
+    use crate::config::UsbEncoder;
+    let filter = if latest_only {
+        format!("scale={}:{}", stream.width, stream.height)
+    } else {
+        format!(
+            "fps={},scale={}:{}",
+            stream.framerate, stream.width, stream.height
+        )
+    };
+    let mut args = vec!["-vf".into(), filter];
+    match config.live_encoder {
+        UsbEncoder::Software => {
+            args.extend(
+                [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                    "-threads",
+                    "1",
+                    "-profile:v",
+                    "baseline",
+                    "-level:v",
+                    "4.1",
+                    "-x264-params",
+                    "repeat-headers=1:aud=1:scenecut=0",
+                ]
+                .map(String::from),
+            );
+        }
+        UsbEncoder::V4l2 => {
+            // Numeric baseline profile works with V4L2 builds that lack named profiles.
+            args.extend(
+                [
+                    "-c:v",
+                    "h264_v4l2m2m",
+                    "-profile:v",
+                    "66",
+                    "-level:v",
+                    "41",
+                    "-bf",
+                    "0",
+                ]
+                .map(String::from),
+            );
+        }
+    }
+    // Independent pictures allow stale output to be discarded without broken references.
+    let gop = if latest_only { 1 } else { stream.framerate };
+    args.extend([
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-b:v".into(),
+        stream.bitrate.to_string(),
+        "-g".into(),
+        gop.to_string(),
+        "-vsync".into(),
+        "0".into(),
+        "-f".into(),
+        "h264".into(),
+        "-flush_packets".into(),
+        "1".into(),
         "pipe:1".into(),
     ]);
     args
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,7 +233,22 @@ mod tests {
             Some(raw),
         );
         assert_eq!(Splitter::default().push(&copied).len(), 2);
-        decode("mjpeg", copied);
+        decode("mjpeg", copied.clone());
+        let piped = run_ffmpeg(
+            pipe_live_args(
+                &UsbConfig::default(),
+                LiveStream {
+                    width: 640,
+                    height: 480,
+                    framerate: 12,
+                    bitrate: 900_000,
+                },
+            ),
+            Some(copied),
+        );
+        let piped_units = AccessUnits::default().push(&piped);
+        assert_eq!(piped_units.len(), 1);
+        decode("h264", piped_units.concat());
 
         for stream in [
             LiveStream {
@@ -172,6 +273,28 @@ mod tests {
             assert_eq!(units.len(), (stream.framerate * 2 - 1) as usize);
             decode("h264", units.concat());
         }
+    }
+
+    #[test]
+    fn hardware_encoder_uses_baseline_and_independent_frames_without_x264_options() {
+        let config = UsbConfig {
+            live_encoder: crate::config::UsbEncoder::V4l2,
+            ..UsbConfig::default()
+        };
+        let args = pipe_live_args(
+            &config,
+            LiveStream {
+                width: 1920,
+                height: 1080,
+                framerate: 12,
+                bitrate: 6_500_000,
+            },
+        );
+        assert!(args.windows(2).any(|a| a == ["-c:v", "h264_v4l2m2m"]));
+        assert!(args.windows(2).any(|a| a == ["-profile:v", "66"]));
+        assert!(args.windows(2).any(|a| a == ["-g", "1"]));
+        assert!(!args.iter().any(|a| a == "-preset" || a == "-x264-params"));
+        assert!(args.windows(2).any(|a| a == ["-vf", "scale=1920:1080"]));
     }
 
     fn test_input(mut args: Vec<String>, mjpeg: bool) -> Vec<String> {

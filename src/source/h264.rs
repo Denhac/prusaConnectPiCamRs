@@ -4,6 +4,7 @@
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 const NAL_SEI: u8 = 6;
 const NAL_SPS: u8 = 7;
+const NAL_PPS: u8 = 8;
 const NAL_AUD: u8 = 9;
 
 /// A buffered access unit larger than this is treated as corrupt and dropped.
@@ -14,6 +15,10 @@ pub struct AccessUnits {
     buf: Vec<u8>,
     current: Vec<u8>,
     has_picture: bool,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    has_sps: bool,
+    has_pps: bool,
 }
 
 impl AccessUnits {
@@ -50,10 +55,24 @@ impl AccessUnits {
         let finished = self.finish_if(starts_access_unit(&nal));
         if nal_type == NAL_SPS {
             patch_sps(&mut nal);
+            self.sps = Some(nal.clone());
+            self.has_sps = true;
+        } else if nal_type == NAL_PPS {
+            self.pps = Some(nal.clone());
+            self.has_pps = true;
         }
         if self.current.len() + nal.len() > MAX_ACCESS_UNIT {
             self.current.clear();
             self.has_picture = false;
+        }
+        // V4L2 encoders may supply headers only at startup. Repeat them on every IDR.
+        if nal_type == 5 && !self.has_picture {
+            for (present, header) in [(self.has_sps, &self.sps), (self.has_pps, &self.pps)] {
+                if !present && let Some(header) = header {
+                    self.current.extend_from_slice(&START_CODE);
+                    self.current.extend_from_slice(header);
+                }
+            }
         }
         self.current.extend_from_slice(&START_CODE);
         self.current.extend_from_slice(&nal);
@@ -67,6 +86,8 @@ impl AccessUnits {
             return None;
         }
         self.has_picture = false;
+        self.has_sps = false;
+        self.has_pps = false;
         Some(std::mem::take(&mut self.current))
     }
 }
@@ -113,6 +134,32 @@ fn trim_trailing_zeros(nal: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeats_parameter_sets_on_headerless_hardware_keyframes() {
+        let input = [
+            nal(&[0x67, 0x42, 0x80, 0x29, 0xaa]),
+            nal(&[0x68, 0xce, 0x3c, 0x80]),
+            nal(&[0x65, 0x88, 0x84, 0x11]),
+            nal(&[0x65, 0x88, 0x84, 0x22]),
+            nal(&[0x65, 0x88, 0x84, 0x33]),
+        ]
+        .concat();
+        for chunk in [1, 5, input.len()] {
+            let mut parser = AccessUnits::default();
+            let frames: Vec<_> = input.chunks(chunk).flat_map(|b| parser.push(b)).collect();
+            assert_eq!(frames.len(), 2);
+            assert_eq!(
+                frames[1],
+                [
+                    nal(&[0x67, 0x42, 0xe0, 0x1f, 0xaa]),
+                    nal(&[0x68, 0xce, 0x3c, 0x80]),
+                    nal(&[0x65, 0x88, 0x84, 0x22]),
+                ]
+                .concat()
+            );
+        }
+    }
 
     fn nal(bytes: &[u8]) -> Vec<u8> {
         [&START_CODE[..], bytes].concat()

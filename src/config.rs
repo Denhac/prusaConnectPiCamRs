@@ -80,6 +80,17 @@ pub struct UsbConfig {
     pub framerate: u32,
     /// FFmpeg input format: usually mjpeg or yuyv422. Empty lets FFmpeg choose.
     pub input_format: String,
+    /// Software libx264, or Linux V4L2 hardware H.264 encoding when available.
+    pub live_encoder: UsbEncoder,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum UsbEncoder {
+    #[default]
+    #[serde(rename = "libx264")]
+    Software,
+    #[serde(rename = "h264_v4l2m2m")]
+    V4l2,
 }
 
 impl Default for UsbConfig {
@@ -91,6 +102,7 @@ impl Default for UsbConfig {
             height: 480,
             framerate: 15,
             input_format: "mjpeg".into(),
+            live_encoder: UsbEncoder::Software,
         }
     }
 }
@@ -426,6 +438,27 @@ mod tests {
                 "accepted {setting}"
             );
         }
+    }
+
+    #[test]
+    fn parses_usb_encoder_and_rejects_unknown_names() {
+        for (name, expected) in [
+            ("libx264", UsbEncoder::Software),
+            ("h264_v4l2m2m", UsbEncoder::V4l2),
+        ] {
+            let config = parse(&format!(
+                "[[camera]]\nid = 'cam0'\nsource = {{ type = 'usb', live_encoder = '{name}' }}"
+            ))
+            .unwrap();
+            let SourceConfig::Usb(usb) = &config.camera(None).unwrap().source else {
+                panic!("expected usb")
+            };
+            assert_eq!(usb.live_encoder, expected);
+        }
+        assert!(
+            parse("[[camera]]\nid = 'cam0'\nsource = { type = 'usb', live_encoder = 'HW' }")
+                .is_err()
+        );
     }
 
     #[test]
