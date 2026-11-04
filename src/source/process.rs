@@ -3,6 +3,7 @@
 //! for them instead, and snapshots pause. Unlike starting a process for each snapshot, the
 //! camera keeps running, so exposure and white balance stay settled between uploads.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -28,7 +29,7 @@ const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
 const MIN_STALL_LIMIT: Duration = Duration::from_secs(30);
 const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Live frames buffered for a viewer that falls behind; beyond this, frames are dropped.
-const LIVE_QUEUE: usize = 3;
+const LIVE_QUEUE: usize = 1;
 
 /// An H.264 stream for live view.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,6 +45,8 @@ pub struct LiveStream {
 pub struct LiveFrame {
     pub data: Bytes,
     pub produced_at: Instant,
+    /// When this JPEG entered the capture reader; absent for direct CSI/raw streams.
+    pub captured_at: Option<Instant>,
     pub keyframe: bool,
 }
 
@@ -403,16 +406,21 @@ fn stream_usb_live(
     let output = encoder.child.as_mut().unwrap().stdout.take().unwrap();
     let stdin = encoder.child.as_mut().unwrap().stdin.take().unwrap();
     let latest = LatestJpeg::default();
+    // Software encoding is covered by the bounded-window integration test. Broadcom
+    // drivers need their normal buffering; track timestamps without gating their input.
+    let flight = EncoderFlight::new(config.live_encoder == crate::config::UsbEncoder::Software);
     let result = thread::scope(|scope| {
         let reader = scope.spawn(|| {
             let result = drain_jpegs(input, &latest);
             latest.close();
             result
         });
-        let writer = scope.spawn(|| feed_jpegs(stdin, &latest, live.framerate));
-        let result = read_live(output, shared, frames);
+        let writer =
+            scope.spawn(|| feed_jpegs_with_flight(stdin, &latest, live.framerate, Some(&flight)));
+        let result = read_live_with_flight(output, shared, frames, Some(&flight));
         // Unblock both pipe workers before joining them, including a stalled stdin write.
         latest.close();
+        flight.close();
         capture.kill();
         encoder.kill();
         let read_result = reader.join().expect("JPEG reader panicked");
@@ -433,19 +441,111 @@ struct LatestJpeg {
 #[derive(Default)]
 struct JpegState {
     seq: u64,
-    latest: Option<Vec<u8>>,
+    latest: Option<CapturedJpeg>,
     closed: bool,
+}
+
+#[derive(Clone)]
+struct CapturedJpeg {
+    data: Vec<u8>,
+    captured_at: Instant,
+}
+
+/// Track submitted timestamps and optionally bound read-ahead for software encoding.
+struct EncoderFlight {
+    state: Mutex<FlightState>,
+    changed: Condvar,
+    bounded: bool,
+}
+
+impl Default for EncoderFlight {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+struct FlightState {
+    pending: VecDeque<Instant>,
+    closed: bool,
+    completed: u64,
+    limit: usize,
+}
+
+impl Default for FlightState {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            closed: false,
+            completed: 0,
+            limit: 3,
+        }
+    }
+}
+
+impl EncoderFlight {
+    fn new(bounded: bool) -> Self {
+        Self {
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            bounded,
+        }
+    }
+
+    fn wait_for_slot(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.closed {
+                return false;
+            }
+            if !self.bounded || state.pending.len() < state.limit {
+                return true;
+            }
+            let (next, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(2), |s| {
+                    s.pending.len() >= s.limit && !s.closed
+                })
+                .unwrap();
+            state = next;
+            // Some hardware encoders need one extra picture to prime. Never grow beyond
+            // four, or grow the window again to compensate for a slow running encoder.
+            if timeout.timed_out() && !state.closed && state.completed == 0 && state.limit == 3 {
+                state.limit = 4;
+                log::warn!("live encoder needs a fourth startup frame; bounded window is now 4");
+            }
+        }
+    }
+
+    fn submitted(&self, captured_at: Instant) {
+        self.state.lock().unwrap().pending.push_back(captured_at);
+    }
+
+    fn completed(&self) -> Option<Instant> {
+        let mut state = self.state.lock().unwrap();
+        let time = state.pending.pop_front();
+        state.completed += 1;
+        self.changed.notify_one();
+        time
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.changed.notify_all();
+    }
 }
 
 impl LatestJpeg {
     fn push(&self, frame: Vec<u8>) {
         let mut state = self.state.lock().unwrap();
         state.seq += 1;
-        state.latest = Some(frame);
+        state.latest = Some(CapturedJpeg {
+            data: frame,
+            captured_at: Instant::now(),
+        });
         self.changed.notify_one();
     }
 
-    fn after(&self, seq: u64) -> Option<(u64, Vec<u8>)> {
+    fn after(&self, seq: u64) -> Option<(u64, CapturedJpeg)> {
         let state = self.state.lock().unwrap();
         let state = self
             .changed
@@ -477,7 +577,17 @@ fn drain_jpegs(mut input: impl Read, latest: &LatestJpeg) -> Result<()> {
     }
 }
 
-fn feed_jpegs(mut output: impl Write, latest: &LatestJpeg, fps: u32) -> Result<()> {
+#[cfg(test)]
+fn feed_jpegs(output: impl Write, latest: &LatestJpeg, fps: u32) -> Result<()> {
+    feed_jpegs_with_flight(output, latest, fps, None)
+}
+
+fn feed_jpegs_with_flight(
+    mut output: impl Write,
+    latest: &LatestJpeg,
+    fps: u32,
+    flight: Option<&EncoderFlight>,
+) -> Result<()> {
     let interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut seq = 0;
     let mut next = Instant::now();
@@ -494,14 +604,24 @@ fn feed_jpegs(mut output: impl Write, latest: &LatestJpeg, fps: u32) -> Result<(
             return Ok(());
         }
         drop(state);
+        if let Some(flight) = flight
+            && !flight.wait_for_slot()
+        {
+            return Ok(());
+        }
         let Some((new_seq, jpeg)) = latest.after(seq) else {
             return Ok(());
         };
         seq = new_seq;
+        let write_started = Instant::now();
+        if let Some(flight) = flight {
+            flight.submitted(jpeg.captured_at);
+        }
         output
-            .write_all(&jpeg)
+            .write_all(&jpeg.data)
             .context("feeding newest JPEG to H.264 encoder")?;
-        next = Instant::now() + interval;
+        // Time blocked by encoder backpressure already counts toward the pacing interval.
+        next = write_started + interval;
     }
 }
 
@@ -527,10 +647,15 @@ fn read_snapshots(mut stdout: impl Read, shared: &Shared) -> Result<()> {
     }
 }
 
-fn read_live(
+fn read_live(stdout: impl Read, shared: &Shared, frames: &mpsc::Sender<LiveFrame>) -> Result<()> {
+    read_live_with_flight(stdout, shared, frames, None)
+}
+
+fn read_live_with_flight(
     mut stdout: impl Read,
     shared: &Shared,
     frames: &mpsc::Sender<LiveFrame>,
+    flight: Option<&EncoderFlight>,
 ) -> Result<()> {
     let mut units = AccessUnits::default();
     let mut buf = vec![0; 64 * 1024];
@@ -543,6 +668,7 @@ fn read_live(
             return Ok(());
         }
         for unit in units.push(&buf[..n]) {
+            let captured_at = flight.and_then(EncoderFlight::completed);
             shared.state.lock().unwrap().last_frame = Some(Instant::now());
             let keyframe = is_keyframe(&unit);
             if recovering && !keyframe {
@@ -551,6 +677,7 @@ fn read_live(
             match frames.try_send(LiveFrame {
                 data: Bytes::from(unit),
                 produced_at: Instant::now(),
+                captured_at,
                 keyframe,
             }) {
                 Ok(()) => recovering = false,
@@ -623,6 +750,80 @@ fn live_args(config: &SourceConfig, stream: LiveStream) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn hardware_timing_tracks_fifo_without_gating_encoder_startup() {
+        let flight = EncoderFlight::new(false);
+        let start = Instant::now();
+        for n in 0..32 {
+            assert!(flight.wait_for_slot());
+            flight.submitted(start + Duration::from_millis(n));
+        }
+        for n in 0..32 {
+            assert_eq!(flight.completed(), Some(start + Duration::from_millis(n)));
+        }
+        assert!(flight.state.lock().unwrap().pending.is_empty());
+        flight.close();
+        assert!(!flight.wait_for_slot());
+    }
+
+    #[test]
+    fn encoder_feedback_caps_read_ahead_and_selects_recent_capture() {
+        use std::sync::mpsc as sync_mpsc;
+        struct Pipe(sync_mpsc::Sender<Vec<u8>>);
+        impl Write for Pipe {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.send(bytes.to_vec()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let latest = Arc::new(LatestJpeg::default());
+        let flight = Arc::new(EncoderFlight::default());
+        let (sent, observed) = sync_mpsc::channel();
+        let worker_latest = Arc::clone(&latest);
+        let worker_flight = Arc::clone(&flight);
+        let worker = thread::spawn(move || {
+            feed_jpegs_with_flight(Pipe(sent), &worker_latest, 1000, Some(&worker_flight))
+        });
+        // The pipe accepts unlimited data; only encoder acknowledgements limit read-ahead.
+        for n in 1..=3 {
+            latest.push(vec![n]);
+            assert_eq!(
+                observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+                vec![n]
+            );
+        }
+        for n in 4..=100 {
+            latest.push(vec![n]);
+        }
+        assert!(observed.recv_timeout(Duration::from_millis(30)).is_err());
+        assert!(flight.completed().is_some());
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            vec![100]
+        );
+        assert_eq!(flight.state.lock().unwrap().pending.len(), 3);
+        latest.close();
+        flight.close();
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn encoder_startup_has_only_one_bounded_extra_slot() {
+        let flight = EncoderFlight::default();
+        for _ in 0..3 {
+            flight.submitted(Instant::now());
+        }
+        assert!(flight.wait_for_slot());
+        assert_eq!(flight.state.lock().unwrap().limit, 4);
+        flight.submitted(Instant::now());
+        flight.close();
+        assert!(!flight.wait_for_slot());
+        assert_eq!(flight.state.lock().unwrap().pending.len(), 4);
+    }
+
     #[tokio::test]
     #[ignore = "requires ffmpeg and local executable fixtures; run with cargo test usb_live_pipeline -- --ignored"]
     async fn usb_live_pipeline_streams_and_reaps_both_children() -> Result<()> {
@@ -672,6 +873,10 @@ esac
                     .context("pipeline ended before four frames")?;
                 assert!(frame.keyframe);
                 assert!(frame.produced_at.elapsed() < Duration::from_millis(500));
+                let captured = frame.captured_at.expect("pipeline preserves capture time");
+                assert!(
+                    frame.produced_at.saturating_duration_since(captured) < Duration::from_secs(2)
+                );
             }
             Ok::<(), anyhow::Error>(())
         }

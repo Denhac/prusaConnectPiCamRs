@@ -149,6 +149,14 @@ the camera and replaces a single stored JPEG. Encoder backpressure makes the fee
 old frames instead of queuing them. Only selected JPEGs are decoded. The encoder input
 queue and outgoing video queue are small; stale outgoing frames are discarded. RTP timing
 uses actual production times rather than pretending a slow encoder met the requested FPS.
+For software encoding, output acknowledges each submitted JPEG: normally no more than
+three pictures are allowed across the FFmpeg pipeline. One extra startup picture may
+prime the pipeline after two seconds; that window never grows beyond four. Hardware
+encoding uses the previously working FFmpeg/driver buffer defaults and does not gate
+input on encoded-frame acknowledgements. The latency-tuning build with smaller hardware
+buffers repeatedly exited on the Pi used for testing, so those overrides were removed. Hardware
+submissions are still timestamped for diagnostics. Only one encoded frame waits in the
+application send queue. Feeder pacing includes time spent blocked by the encoder.
 Independent H.264 pictures and repeated parameter sets allow safe frame dropping. This
 can increase bandwidth compared with inter-frame encoding; the bitrate is a target, not
 a strict network cap.
@@ -189,6 +197,20 @@ as described in its [manual](https://github.com/pikvm/ustreamer/blob/master/man/
 Prusa Connect live view here sends H.264, which requires a separate encode. A synthetic
 1080p baseline hardware encode/decode probe succeeded on the Pi 2 used during development;
 end-to-end webcam/browser latency must still be measured on the Pi.
+
+During live view the service logs `live timing` every five seconds. `capture-to-encoded`
+measures from the JPEG capture reader to completed H.264 output, including input parsing,
+decode, encode and output parsing; it does not include exposure or camera/USB buffering.
+`send-queue` measures waiting after encoding and `send-write` measures the WebRTC write.
+These are Pi-side diagnostics, not a measurement of network/browser playback delay:
+
+```shell
+sudo journalctl -u prusa-connect-camera --since "2 minutes ago" --no-pager | grep -E 'live timing|fourth startup'
+```
+
+After installing an update, close/reopen the viewer before timing a moving clock or hand
+in front of the camera. A one-second end-to-end delay is a target to measure, not a guarantee;
+the Pi's actual encode rate and the viewer's playback buffering still affect the result.
 
 The SSH deployment script currently requires **64-bit OS and a CSI camera**. For USB,
 follow [Install by hand](#install-by-hand) using the ARMv7 build described above for a

@@ -292,6 +292,11 @@ mod tests {
         );
         assert!(args.windows(2).any(|a| a == ["-c:v", "h264_v4l2m2m"]));
         assert!(args.windows(2).any(|a| a == ["-profile:v", "66"]));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "-num_output_buffers" || a == "-num_capture_buffers")
+        );
         assert!(args.windows(2).any(|a| a == ["-g", "1"]));
         assert!(!args.iter().any(|a| a == "-preset" || a == "-x264-params"));
         assert!(args.windows(2).any(|a| a == ["-vf", "scale=1920:1080"]));

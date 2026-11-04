@@ -491,6 +491,7 @@ async fn send_frames(
         .context("the video track has no SSRC")?;
     let mut clock = LiveClock::new(framerate);
     let mut recovering = false;
+    let mut timing = LiveTiming::default();
     loop {
         let Ok(frame) = tokio::time::timeout(VIDEO_TIMEOUT, frames.recv()).await else {
             bail!("the camera sent no video for {}s", VIDEO_TIMEOUT.as_secs());
@@ -506,6 +507,7 @@ async fn send_frames(
             continue;
         }
         recovering = false;
+        let send_started = Instant::now();
         let duration = clock.duration(frame.produced_at);
         track
             .sample_writer(ssrc, payload_type)
@@ -515,6 +517,67 @@ async fn send_frames(
                 ..Sample::new(frame.produced_at)
             })
             .await?;
+        timing.record(
+            frame
+                .captured_at
+                .map(|t| frame.produced_at.saturating_duration_since(t)),
+            send_started.saturating_duration_since(frame.produced_at),
+            send_started.elapsed(),
+        );
+    }
+}
+
+struct LiveTiming {
+    since: Instant,
+    count: u32,
+    pipeline_count: u32,
+    pipeline_total: Duration,
+    pipeline_max: Duration,
+    queue_total: Duration,
+    queue_max: Duration,
+    write_max: Duration,
+}
+
+impl Default for LiveTiming {
+    fn default() -> Self {
+        Self {
+            since: Instant::now(),
+            count: 0,
+            pipeline_count: 0,
+            pipeline_total: Duration::ZERO,
+            pipeline_max: Duration::ZERO,
+            queue_total: Duration::ZERO,
+            queue_max: Duration::ZERO,
+            write_max: Duration::ZERO,
+        }
+    }
+}
+
+impl LiveTiming {
+    fn record(&mut self, pipeline: Option<Duration>, queue: Duration, write: Duration) {
+        self.count += 1;
+        self.queue_total += queue;
+        self.queue_max = self.queue_max.max(queue);
+        self.write_max = self.write_max.max(write);
+        if let Some(pipeline) = pipeline {
+            self.pipeline_count += 1;
+            self.pipeline_total += pipeline;
+            self.pipeline_max = self.pipeline_max.max(pipeline);
+        }
+        let elapsed = self.since.elapsed();
+        if elapsed >= Duration::from_secs(5) {
+            log::info!(
+                "live timing: {:.1} fps; capture-to-encoded avg/max={}/{} ms ({} samples); send-queue avg/max={}/{} ms; send-write max={} ms",
+                self.count as f64 / elapsed.as_secs_f64(),
+                (self.pipeline_total / self.pipeline_count.max(1)).as_millis(),
+                self.pipeline_max.as_millis(),
+                self.pipeline_count,
+                (self.queue_total / self.count).as_millis(),
+                self.queue_max.as_millis(),
+                self.write_max.as_millis()
+            );
+            *self = Self::default();
+        }
     }
 }
 
