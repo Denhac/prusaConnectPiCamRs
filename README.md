@@ -1,9 +1,9 @@
 # prusaConnectCamera
 
-Uploads snapshots from Raspberry Pi cameras to [Prusa Connect](https://connect.prusa3d.com),
+Uploads snapshots from Raspberry Pi CSI cameras or Linux USB webcams to [Prusa Connect](https://connect.prusa3d.com),
 so a printer without its own camera gets one in the Connect dashboard.
 
-It runs as one small service per Pi. It keeps `rpicam-vid` streaming at a low frame rate and
+It runs as one small service per Pi. It keeps `rpicam-vid` (CSI) or FFmpeg (USB) streaming and
 uploads the newest frame every 15 seconds. Because the camera stays running, exposure and white
 balance stay settled, unlike starting `rpicam-still` for every snapshot.
 
@@ -16,14 +16,20 @@ the CPU goes to `rpicam-vid` encoding a JPEG every second.
 
 ## Requirements
 
-- A Raspberry Pi with a camera on its camera connector (developed for the Pi 4).
-- Raspberry Pi OS Bookworm or newer, preferably 64-bit, with `rpicam-apps` installed
+- A Raspberry Pi with a CSI camera or a Linux-compatible USB webcam (developed for the Pi 4;
+  USB support and Pi 2 performance still need hardware testing).
+- Raspberry Pi OS Bookworm or newer. For CSI cameras, install `rpicam-apps`
   (`sudo apt install rpicam-apps-lite` on Lite images). Check the camera works with
   `rpicam-hello --list-cameras`.
+- For USB webcams, install `ffmpeg` and `v4l-utils`: `sudo apt install ffmpeg v4l-utils`.
+  See [USB webcams](#usb-webcams-including-raspberry-pi-2) for configuration.
 - A camera added in Prusa Connect: open the printer, go to **Camera**, click
   **Add new other camera** and copy its token.
 
 ## Build
+
+Install Rust with rustup and the Linux build tools (`sudo apt install build-essential
+pkg-config clang` on Debian/Ubuntu). The project requires Rust 1.88 or newer.
 
 Cross-compile a static binary on a Linux PC with `clang` installed, then copy
 `target/aarch64-unknown-linux-musl/release/prusa-connect-camera` to the Pi:
@@ -33,12 +39,41 @@ rustup target add aarch64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-musl
 ```
 
-Or build on the Pi itself, which is slower but needs nothing else:
+Or build on the Pi itself with the build tools installed, which is slower:
 
 ```shell
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo build --release
 ```
+
+For a Pi 2 running **32-bit Raspberry Pi OS**, cross-compile on an Ubuntu/Debian Linux PC
+(or Ubuntu WSL):
+
+```shell
+sudo apt install gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+rustup target add armv7-unknown-linux-gnueabihf
+cargo build --locked --release --target armv7-unknown-linux-gnueabihf
+```
+
+Copy `target/armv7-unknown-linux-gnueabihf/release/prusa-connect-camera` to the Pi.
+The verified build uses the system C library and requires glibc 2.34 or newer
+(Bookworm and newer meet that requirement).
+
+Run checks on the development machine:
+
+```shell
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+# Also exercise JPEG encoding, MJPEG copying and H.264 parsing/decoding with FFmpeg:
+cargo test --locked ffmpeg_synthetic_streams -- --ignored
+# Verify route detection with two real WebRTC peers over loopback UDP:
+cargo test --locked detects_local_video_route -- --ignored
+```
+
+Native Linux tests and both the ARMv7 and AArch64 release builds have been verified in
+Ubuntu WSL with Rust 1.99.1. The FFmpeg test uses synthetic input; webcam access and Pi 2
+performance still need testing on the hardware.
 
 ## Deploy over SSH
 
@@ -61,6 +96,132 @@ the previous program if the new one fails. Run `deploy/deploy.sh --help` for eve
 
 Without SSH keys on the Pis, set `SSHPASS` to the login password (needs `sshpass`). sudo uses
 `PI_SUDO_PASSWORD`, or `SSHPASS` when that is unset.
+
+## USB webcams (including Raspberry Pi 2)
+
+The `usb` source uses [FFmpeg's V4L2 input](https://ffmpeg.org/ffmpeg-devices.html#video4linux2_002c-v4l2).
+CSI cameras still use `type = "rpicam"`; both types can be configured in the same service.
+USB capture does not require `rpicam-apps`.
+
+Install the tools and check which capture modes your webcam supports:
+
+```shell
+sudo apt install ffmpeg v4l-utils
+v4l2-ctl --list-devices
+v4l2-ctl --device /dev/video0 --list-formats-ext
+```
+
+In your camera's existing config, replace its `[camera.source]` section with the following.
+Choose a size, frame rate and format the webcam advertises; 640x480 at 15 fps is a starting
+point, not a mode every webcam supports. `MJPG` in `v4l2-ctl` corresponds to `mjpeg` here;
+`YUYV` corresponds to `yuyv422`.
+
+```toml
+[camera.source]
+type = "usb"
+device = "/dev/video0"
+width = 640
+height = 480
+framerate = 15
+input_format = "mjpeg"
+```
+
+Prefer a `/dev/v4l/by-id/...` device path if you have multiple cameras, since `/dev/video0`
+can change after a reboot. The service already belongs to the `video` group; manual runs
+also need permission to read the device. `list-cameras` remains CSI-only; use `v4l2-ctl`
+for USB devices.
+
+MJPEG snapshots copy the webcam's JPEG frames without decoding or re-encoding them. The
+configured frame rate is the webcam capture rate; the camera's `interval` still controls
+uploads (15 seconds by default). USB has no `quality`, rotation or CSI sensor controls in
+this config. For raw-only webcams set `input_format = "yuyv422"` (or `""` for automatic
+format selection); FFmpeg then encodes one JPEG per second in software.
+
+Keep `live = false` (the default, in the `[[camera]]` section) initially on a Pi 2.
+USB live view is available with `live = true` and a web-camera token. FFmpeg's `libx264`
+software encoder is the default. On a Pi with working Broadcom codec devices, set
+`live_encoder = "h264_v4l2m2m"` under `[camera.source]` to use hardware H.264 encoding.
+Live view scales from the configured capture mode, and snapshots pause while someone
+watches, just as they do for CSI cameras.
+
+For MJPEG webcams, capture runs separately from H.264 encoding: it continuously drains
+the camera and replaces a single stored JPEG. Encoder backpressure makes the feeder skip
+old frames instead of queuing them. Only selected JPEGs are decoded. The encoder input
+queue and outgoing video queue are small; stale outgoing frames are discarded. RTP timing
+uses actual production times rather than pretending a slow encoder met the requested FPS.
+For software encoding, output acknowledges each submitted JPEG: normally no more than
+three pictures are allowed across the FFmpeg pipeline. One extra startup picture may
+prime the pipeline after two seconds; that window never grows beyond four. Hardware
+encoding uses the previously working FFmpeg/driver buffer defaults and does not gate
+input on encoded-frame acknowledgements. The latency-tuning build with smaller hardware
+buffers repeatedly exited on the Pi used for testing, so those overrides were removed. Hardware
+submissions are still timestamped for diagnostics. Only one encoded frame waits in the
+application send queue. Feeder pacing includes time spent blocked by the encoder.
+Independent H.264 pictures and repeated parameter sets allow safe frame dropping. This
+can increase bandwidth compared with inter-frame encoding; the bitrate is a target, not
+a strict network cap.
+
+For 1080p on a Pi 2 with working hardware encoding, use:
+
+```toml
+[[camera]]
+id = "cam0"
+name = "Printer cam"
+interval = 10
+live = true
+live_quality = "fhd"
+
+[camera.source]
+type = "usb"
+device = "/dev/video0"
+width = 1920
+height = 1080
+framerate = 30
+input_format = "mjpeg"
+live_encoder = "h264_v4l2m2m"
+```
+
+Install the updated binary before adding `live_encoder`, then restart the service and
+close/reopen live view to discard any playback delay already accumulated in the browser.
+Both the service and a manual test need exclusive access to the webcam; stop uStreamer
+and other webcam services before using this one.
+
+Check hardware support with `v4l2-ctl --list-devices` and `ffmpeg -hide_banner -encoders`.
+The encoder being listed does not guarantee the driver can open it. Hardware failure is
+logged and retried; it does not silently fall back to CPU encoding. Use
+`live_encoder = "libx264"` for software fallback. The latest-frame handoff requires
+`input_format = "mjpeg"`; raw-only webcams currently use the direct FFmpeg path.
+
+uStreamer's `--encoder=HW` with MJPEG uses the webcam's pre-encoded JPEGs directly,
+as described in its [manual](https://github.com/pikvm/ustreamer/blob/master/man/ustreamer.1).
+Prusa Connect live view here sends H.264, which requires a separate encode. A synthetic
+1080p baseline hardware encode/decode probe succeeded on the Pi 2 used during development;
+end-to-end webcam/browser latency must still be measured on the Pi.
+
+During live view the service logs `live timing` every five seconds. `capture-to-encoded`
+measures from the JPEG capture reader to completed H.264 output, including input parsing,
+decode, encode and output parsing; it does not include exposure or camera/USB buffering.
+`send-queue` measures waiting after encoding and `send-write` measures the WebRTC write.
+These are Pi-side diagnostics, not a measurement of network/browser playback delay:
+
+```shell
+sudo journalctl -u prusa-connect-camera --since "2 minutes ago" --no-pager | grep -E 'live timing|fourth startup'
+```
+
+After installing an update, close/reopen the viewer before timing a moving clock or hand
+in front of the camera. A one-second end-to-end delay is a target to measure, not a guarantee;
+the Pi's actual encode rate and the viewer's playback buffering still affect the result.
+
+The SSH deployment script currently requires **64-bit OS and a CSI camera**. For USB,
+follow [Install by hand](#install-by-hand) using the ARMv7 build described above for a
+32-bit Pi 2. The `aarch64` binary is for 64-bit systems and will not run on a 32-bit OS.
+Building on the Pi 2 itself may take a long time and need swap.
+
+Before enabling the service, check capture without a token or an upload:
+
+```shell
+prusa-connect-camera --config /etc/prusa-connect-camera/config.toml snapshot -o webcam.jpg
+```
 
 ## Install by hand
 
@@ -114,10 +275,53 @@ with its own token from Prusa Connect, and a matching `LoadCredential=` line in 
 
 ## Live view
 
+Capture settings (`width`, `height`, `framerate`) select the USB webcam's input mode;
+they do not force live-video output to use that resolution or frame rate. Live settings
+arrive automatically through Prusa Connect signaling. The service waits for the established
+connection before applying their scope: TURN-only settings apply to relayed video, while
+local connections use the HD default (up to 1280 pixels wide at 12 fps) unless matching
+settings specify otherwise. Settings scoped to all connections still apply locally.
+To choose Full HD as the default, put `live_quality = "fhd"` in the `[[camera]]`
+section, **before** `[camera.source]`. Available presets are `"sd"`, `"hd"` (the default),
+and `"fhd"`. This changes the fallback for direct/local and STUN connections; applicable
+signaling limits still take precedence, and relayed or unknown routes keep their existing
+defaults. Output is capped to the capture/sensor size and keeps its aspect ratio.
+
+For a USB webcam capable of 1080p:
+
+```toml
+[[camera]]
+id = "cam0"
+name = "Printer cam"
+interval = 10
+live = true
+live_quality = "fhd"
+
+[camera.source]
+type = "usb"
+device = "/dev/video0"
+width = 1920
+height = 1080
+framerate = 30
+input_format = "mjpeg"
+```
+
+Install a binary supporting `live_quality` before adding it, then restart the service and
+reopen live view. With the default live frame rate this selects 1920x1080 at 12 fps and a
+target bitrate of 6.5 Mbps on a local connection. The webcam's capture frame rate remains
+independent. Software H.264 encoding at 1080p can be demanding on a Pi 2; check actual FPS
+and CPU usage, and return to `"hd"` if it cannot keep up.
+
+Logs show the requested quality and scope, followed by the actual connection type and
+selected output resolution, frame rate and bitrate.
+Route detection reads the video transport's selected ICE pair directly; missing candidate
+entries in a statistics report must not cause a known local route to be treated as unknown.
+
 Prusa Connect can also show a live stream from the camera, with a play button over its picture.
 For this the program acts as a Prusa "web camera": it speaks the same signaling and WebRTC
-protocol as Prusa's browser webcam app, and streams H.264 from the Pi's hardware encoder while
-someone watches. Snapshots pause during that time and resume afterwards.
+protocol as Prusa's browser webcam app, and streams H.264 while someone watches (the Pi's
+hardware encoder for CSI, configurable software or V4L2 hardware encoding for USB). Snapshots pause during that
+time and resume afterwards.
 
 1. In Prusa Connect, open the printer's **Camera** tab and add a **web camera** rather than
    "Add new other camera", and copy its token.
