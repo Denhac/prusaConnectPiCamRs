@@ -12,7 +12,7 @@ use crate::config::{CameraConfig, Config, SourceConfig};
 use crate::connect::{Client, ConnectError, REQUEST_TIMEOUT};
 use crate::fingerprint;
 use crate::live;
-use crate::source::rpicam::Rpicam;
+use crate::source::process::CameraSource;
 use crate::source::{self, CAPTURE_TIMEOUT, FrameSource, Paused};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -40,19 +40,25 @@ impl Camera {
         let token = camera.load_token()?;
         let fingerprint = fingerprint::load_or_create(&config.state_dir, &camera.id)?;
         let (source, live): (Box<dyn FrameSource>, _) = match &camera.source {
-            SourceConfig::Rpicam(rpicam_config) => {
-                let rpicam = Rpicam::start(rpicam_config)?;
+            SourceConfig::Rpicam(_) | SourceConfig::Usb(_) => {
+                let source = CameraSource::start(&camera.source)?;
+                let (resolution, sensor_size) = match &camera.source {
+                    SourceConfig::Rpicam(c) => ((c.width, c.height), c.live_sensor_size()),
+                    SourceConfig::Usb(c) => ((c.width, c.height), (c.width, c.height)),
+                    SourceConfig::File(_) => unreachable!(),
+                };
                 let live = camera.live.then(|| live::Camera {
                     id: camera.id.clone(),
                     name: camera.name.clone().unwrap_or_else(|| camera.id.clone()),
                     token: token.clone(),
                     fingerprint: fingerprint.clone(),
                     hardware: live::hardware(),
-                    resolution: (rpicam_config.width, rpicam_config.height),
-                    sensor_size: rpicam_config.live_sensor_size(),
-                    source: rpicam.clone(),
+                    resolution,
+                    sensor_size,
+                    live_quality: camera.live_quality,
+                    source: source.clone(),
                 });
-                (Box::new(rpicam), live)
+                (Box::new(source), live)
             }
             other => (source::open(other)?, None),
         };

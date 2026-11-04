@@ -16,7 +16,6 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
     RTCRtpEncodingParameters, RtpCodecKind,
 };
-use rtc::statistics::stats::ice_candidate_pair::RTCStatsIceCandidatePairState;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
@@ -27,13 +26,13 @@ use webrtc::peer_connection::{
     MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
     RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceCandidateType, RTCIceGatheringState,
     RTCIceServer, RTCIceTransportPolicy, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
-    RTCSessionDescription, RTCStatsReportEntry, Registry, SettingEngineBuilder, StatsSelector,
-    register_default_interceptors,
+    RTCSessionDescription, Registry, SettingEngineBuilder, register_default_interceptors,
 };
 use webrtc::rtp_transceiver::RtpSender;
 
 use super::proto::{self, ApplyScope, ConnectionType, IcePolicy, VideoQuality};
-use crate::source::rpicam::{LiveStream, Rpicam};
+use crate::config::LiveQuality;
+use crate::source::process::{CameraSource, LiveStream};
 
 const PAYLOAD_TYPE: u8 = 102;
 /// The profile Prusa Connect's viewers accept; the camera's SPS is patched to match.
@@ -102,9 +101,10 @@ pub struct Session {
     /// Held until the session has finished, so shutdown can wait for it.
     pub _alive: mpsc::Sender<()>,
     pub request: proto::Webrtc,
-    pub camera: Rpicam,
+    pub camera: CameraSource,
     /// The size of the sensor mode live view reads, which gives its streams their shape.
     pub sensor_size: (u32, u32),
+    pub live_quality: LiveQuality,
     pub out: mpsc::Sender<Outgoing>,
     /// Closed by signaling to end the session.
     pub commands: mpsc::Receiver<Command>,
@@ -144,7 +144,7 @@ pub async fn run(mut session: Session) {
 
 /// Hands the camera back to snapshots when a session ends, however it ends.
 struct LiveGuard {
-    camera: Rpicam,
+    camera: CameraSource,
     id: u64,
 }
 
@@ -191,20 +191,39 @@ pub fn stream_for(
     }
 }
 
+/// Apply quality and FPS limits only to the connection types they describe. Wait for ICE
+/// before choosing: an offer that allows TURN can still establish a direct LAN connection.
+fn stream_for_connection(
+    settings: Option<&proto::VideoSettings>,
+    kind: &str,
+    sensor_size: (u32, u32),
+    default_quality: LiveQuality,
+) -> LiveStream {
+    let settings = settings.filter(|s| scope_applies(Some(s.apply_scope()), kind));
+    let default_settings = proto::VideoSettings {
+        video_quality: match default_quality {
+            LiveQuality::Sd => VideoQuality::Sd,
+            LiveQuality::Hd => VideoQuality::Hd,
+            LiveQuality::Fhd => VideoQuality::Fhd,
+        } as i32,
+        ..Default::default()
+    };
+    let settings = settings.or_else(|| matches!(kind, "p2p" | "stun").then_some(&default_settings));
+    // Unknown routes keep scoped settings and use the conservative relay default otherwise.
+    stream_for(settings, matches!(kind, "turn" | "unknown"), sensor_size)
+}
+
 async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
     let started = Instant::now();
     let ice = s.request.ice_configuration.clone().unwrap_or_default();
     let video = s.request.video_settings.clone();
     let relay_only = ice.ice_transport_policy() == IcePolicy::Relay;
-    let stream = stream_for(video.as_ref(), relay_only, s.sensor_size);
     log::info!(
-        "[{}] live view requested: {}x{} at {} fps, {} kbit/s{}",
+        "[{}] live view requested: quality={:?}, fps={:?}, scope={:?}, relay_only={relay_only}",
         s.camera_id,
-        stream.width,
-        stream.height,
-        stream.framerate,
-        stream.bitrate / 1000,
-        if relay_only { ", relayed" } else { "" }
+        video.as_ref().map(|v| v.video_quality()),
+        video.as_ref().map(|v| v.video_fps),
+        video.as_ref().map(|v| v.apply_scope()),
     );
 
     let codec = RTCRtpCodec {
@@ -281,7 +300,6 @@ async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
         s,
         &pc,
         &mut state_changes,
-        stream,
         video.as_ref(),
         &candidates,
         connected,
@@ -297,7 +315,6 @@ async fn drive(
     s: &mut Session,
     pc: &impl PeerConnection,
     state_changes: &mut mpsc::Receiver<RTCPeerConnectionState>,
-    stream: LiveStream,
     video: Option<&proto::VideoSettings>,
     candidates: &Mutex<Candidates>,
     connected: &mut bool,
@@ -377,6 +394,9 @@ async fn drive(
                         })
                         .await?;
                     if media.is_none() {
+                        let (local, remote) = connection_types(sender.as_ref()).await;
+                        let kind = connection_kind(local, remote);
+                        let stream = stream_for_connection(video, kind, s.sensor_size, s.live_quality);
                         let live = s.camera.start_live(stream);
                         _live = Some(LiveGuard { camera: s.camera.clone(), id: live.id });
                         media = Some(TaskGuard(tokio::spawn(send_frames(
@@ -385,11 +405,13 @@ async fn drive(
                             live.frames,
                             stream.framerate,
                         ))));
-                        let (local, remote) = connection_types(pc).await;
-                        let kind = connection_kind(local, remote);
                         log::info!(
-                            "[{}] live view connected ({kind}); snapshots paused",
-                            s.camera_id
+                            "[{}] live view connected ({kind}): {}x{} at {} fps, {} kbit/s; snapshots paused",
+                            s.camera_id,
+                            stream.width,
+                            stream.height,
+                            stream.framerate,
+                            stream.bitrate / 1000,
                         );
                         s.out
                             .send(Outgoing::Connected {
@@ -628,52 +650,42 @@ fn local_ip() -> Result<IpAddr> {
     Ok(socket.local_addr()?.ip())
 }
 
-/// The candidate types of the connection's selected pair.
-async fn connection_types(pc: &impl PeerConnection) -> (ConnectionType, ConnectionType) {
-    let report = pc.get_stats(Instant::now(), StatsSelector::None).await;
-    let pairs = || {
-        report.iter().filter_map(|entry| match entry {
-            RTCStatsReportEntry::IceCandidatePair(pair) => Some(pair),
-            _ => None,
-        })
-    };
-    // Like Prusa's webcam: the transport's selected pair, else a nominated or succeeded one.
-    let pair = report
-        .iter()
-        .find_map(|entry| match entry {
-            RTCStatsReportEntry::Transport(t) => match report.get(&t.selected_candidate_pair_id) {
-                Some(RTCStatsReportEntry::IceCandidatePair(pair)) => Some(pair),
-                _ => None,
+/// Read the video sender's actual ICE route. Stats can have a nominated pair without its
+/// candidate entries; following their IDs then incorrectly classifies a LAN route as unknown.
+async fn connection_types(sender: &dyn RtpSender) -> (ConnectionType, ConnectionType) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match sender.transport().await {
+            Ok(Some(dtls)) => match dtls.ice_transport().get_selected_candidate_pair().await {
+                Ok(Some(pair)) => {
+                    return (
+                        candidate_connection_type(pair.local().typ),
+                        candidate_connection_type(pair.remote().typ),
+                    );
+                }
+                Err(e) => log::debug!("reading selected ICE pair: {e}"),
+                Ok(None) => {}
             },
-            _ => None,
-        })
-        .or_else(|| pairs().find(|pair| pair.nominated))
-        .or_else(|| pairs().find(|pair| pair.state == RTCStatsIceCandidatePairState::Succeeded));
-    let Some(pair) = pair else {
-        log::debug!("no candidate pair among {} stats entries", report.len());
-        return (ConnectionType::Unknown, ConnectionType::Unknown);
-    };
-    // A pair holds its candidates' bare ids, but webrtc-rs keys the candidates themselves with a
-    // prefix, so try both.
-    let candidate_type = |id: &str, prefix: &str| match report
-        .get(id)
-        .or_else(|| report.get(&format!("{prefix}{id}")))
-    {
-        Some(RTCStatsReportEntry::LocalCandidate(c) | RTCStatsReportEntry::RemoteCandidate(c)) => {
-            match c.candidate_type {
-                RTCIceCandidateType::Host => ConnectionType::Host,
-                RTCIceCandidateType::Srflx => ConnectionType::ServerReflexive,
-                RTCIceCandidateType::Prflx => ConnectionType::PeerReflexive,
-                RTCIceCandidateType::Relay => ConnectionType::Relayed,
-                _ => ConnectionType::Unknown,
-            }
+            Err(e) => log::debug!("reading video transport: {e}"),
+            Ok(None) => {}
         }
+        // Allow a short delay if the connection event precedes transport visibility.
+        if tokio::time::Instant::now() >= deadline {
+            log::warn!("couldn't determine the selected video ICE route; keeping scoped limits");
+            return (ConnectionType::Unknown, ConnectionType::Unknown);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn candidate_connection_type(kind: RTCIceCandidateType) -> ConnectionType {
+    match kind {
+        RTCIceCandidateType::Host => ConnectionType::Host,
+        RTCIceCandidateType::Srflx => ConnectionType::ServerReflexive,
+        RTCIceCandidateType::Prflx => ConnectionType::PeerReflexive,
+        RTCIceCandidateType::Relay => ConnectionType::Relayed,
         _ => ConnectionType::Unknown,
-    };
-    (
-        candidate_type(&pair.local_candidate_id, "RTCLocalIceCandidate_"),
-        candidate_type(&pair.remote_candidate_id, "RTCRemoteIceCandidate_"),
-    )
+    }
 }
 
 /// Summarizes a connection the way Prusa's webcam does: relayed, through STUN, or direct.
@@ -710,6 +722,147 @@ mod tests {
     const MODULE_2: (u32, u32) = (1640, 1232);
     const MODULE_3: (u32, u32) = (2304, 1296);
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires local UDP sockets; run with cargo test detects_local_video_route -- --ignored"]
+    async fn detects_local_video_route() -> Result<()> {
+        struct TestHandler {
+            gathered: mpsc::Sender<()>,
+            connected: mpsc::Sender<()>,
+        }
+
+        #[async_trait::async_trait]
+        impl PeerConnectionEventHandler for TestHandler {
+            async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+                if state == RTCIceGatheringState::Complete {
+                    let _ = self.gathered.try_send(());
+                }
+            }
+
+            async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+                if state == RTCPeerConnectionState::Connected {
+                    let _ = self.connected.try_send(());
+                }
+            }
+        }
+
+        let codec = RTCRtpCodec {
+            mime_type: MIME_TYPE_H264.into(),
+            clock_rate: 90_000,
+            sdp_fmtp_line: H264_FMTP.into(),
+            ..Default::default()
+        };
+        let engine = || -> Result<MediaEngine> {
+            let mut engine = MediaEngine::default();
+            engine.register_codec(
+                RTCRtpCodecParameters {
+                    rtp_codec: codec.clone(),
+                    payload_type: PAYLOAD_TYPE,
+                },
+                RtpCodecKind::Video,
+            )?;
+            Ok(engine)
+        };
+        let (gather_a, mut gathered_a) = mpsc::channel(1);
+        let (connected_a, mut connection_a) = mpsc::channel(1);
+        let (gather_b, mut gathered_b) = mpsc::channel(1);
+        let (connected_b, _connection_b) = mpsc::channel(1);
+        let runtime = webrtc::runtime::default_runtime().context("no test runtime")?;
+        let a = PeerConnectionBuilder::new()
+            .with_handler(Arc::new(TestHandler {
+                gathered: gather_a,
+                connected: connected_a,
+            }))
+            .with_runtime(runtime.clone())
+            .with_media_engine(engine()?)
+            .with_udp_addrs(vec![SocketAddr::from(([127, 0, 0, 1], 0))])
+            .build()
+            .await?;
+        let b = PeerConnectionBuilder::new()
+            .with_handler(Arc::new(TestHandler {
+                gathered: gather_b,
+                connected: connected_b,
+            }))
+            .with_runtime(runtime)
+            .with_media_engine(engine()?)
+            .with_udp_addrs(vec![SocketAddr::from(([127, 0, 0, 1], 0))])
+            .build()
+            .await?;
+
+        let result = async {
+            let track = Arc::new(TrackLocalStaticSample::new(
+                Instant::now(),
+                MediaStreamTrack::new(
+                    "test".into(),
+                    "video".into(),
+                    "video".into(),
+                    RtpCodecKind::Video,
+                    vec![RTCRtpEncodingParameters {
+                        rtp_coding_parameters: RTCRtpCodingParameters {
+                            ssrc: Some(1234),
+                            ..Default::default()
+                        },
+                        codec,
+                        ..Default::default()
+                    }],
+                ),
+            )?);
+            let sender = a.add_track(track as Arc<dyn TrackLocal>).await?;
+            let _channel = a.create_data_channel("ping-pong", None).await?;
+            a.set_local_description(a.create_offer(None).await?).await?;
+            tokio::time::timeout(Duration::from_secs(5), gathered_a.recv())
+                .await?
+                .context("offer gathering stopped")?;
+            b.set_remote_description(a.local_description().await.context("missing offer")?)
+                .await?;
+            b.set_local_description(b.create_answer(None).await?)
+                .await?;
+            tokio::time::timeout(Duration::from_secs(5), gathered_b.recv())
+                .await?
+                .context("answer gathering stopped")?;
+            a.set_remote_description(b.local_description().await.context("missing answer")?)
+                .await?;
+            tokio::time::timeout(Duration::from_secs(15), connection_a.recv())
+                .await?
+                .context("connection stopped")?;
+
+            // Read immediately at Connected, as production does, before sending video.
+            let (local, remote) = connection_types(sender.as_ref()).await;
+            assert_eq!(
+                (local, remote),
+                (ConnectionType::Host, ConnectionType::Host)
+            );
+            let kind = connection_kind(local, remote);
+            assert_eq!(kind, "p2p");
+            let limit = proto::VideoSettings {
+                video_quality: VideoQuality::Sd as i32,
+                video_fps: 12,
+                apply_scope: ApplyScope::Turn as i32,
+                ..Default::default()
+            };
+            let stream = stream_for_connection(Some(&limit), kind, (1920, 1080), LiveQuality::Hd);
+            assert_eq!((stream.width, stream.height), (1280, 720));
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        // Release both UDP transports even if negotiation returns an error.
+        let _ = a.close().await;
+        let _ = b.close().await;
+        result
+    }
+
+    #[test]
+    fn maps_selected_candidate_types() {
+        for (candidate, connection) in [
+            (RTCIceCandidateType::Host, ConnectionType::Host),
+            (RTCIceCandidateType::Srflx, ConnectionType::ServerReflexive),
+            (RTCIceCandidateType::Prflx, ConnectionType::PeerReflexive),
+            (RTCIceCandidateType::Relay, ConnectionType::Relayed),
+            (RTCIceCandidateType::Unspecified, ConnectionType::Unknown),
+        ] {
+            assert_eq!(candidate_connection_type(candidate), connection);
+        }
+    }
+
     fn size(quality: VideoQuality, sensor: (u32, u32)) -> (u32, u32) {
         let settings = proto::VideoSettings {
             video_quality: quality as i32,
@@ -744,6 +897,144 @@ mod tests {
                 framerate: 10,
                 bitrate: 900_000
             }
+        );
+    }
+
+    #[test]
+    fn relay_scoped_quality_and_fps_do_not_limit_local_video() {
+        let settings = proto::VideoSettings {
+            video_quality: VideoQuality::Sd as i32,
+            video_fps: 10,
+            apply_scope: ApplyScope::Turn as i32,
+            ..Default::default()
+        };
+        for kind in ["p2p", "stun"] {
+            assert_eq!(
+                stream_for_connection(Some(&settings), kind, (1920, 1080), LiveQuality::Hd),
+                LiveStream {
+                    width: 1280,
+                    height: 720,
+                    framerate: DEFAULT_FPS,
+                    bitrate: 2_500_000,
+                },
+                "connection: {kind}"
+            );
+        }
+        for kind in ["turn", "unknown"] {
+            assert_eq!(
+                stream_for_connection(Some(&settings), kind, (1920, 1080), LiveQuality::Hd),
+                LiveStream {
+                    width: 640,
+                    height: 360,
+                    framerate: 10,
+                    bitrate: 900_000,
+                },
+                "connection: {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_settings_follow_each_connection_scope() {
+        for (scope, limited) in [
+            (ApplyScope::Turn, [false, false, true]),
+            (ApplyScope::Stun, [false, true, false]),
+            (ApplyScope::P2p, [true, false, false]),
+            (ApplyScope::TurnAndStun, [false, true, true]),
+            (ApplyScope::Any, [true, true, true]),
+            (ApplyScope::Unspecified, [true, true, true]),
+        ] {
+            let settings = proto::VideoSettings {
+                video_quality: VideoQuality::Sd as i32,
+                video_fps: 7,
+                apply_scope: scope as i32,
+                ..Default::default()
+            };
+            for (kind, applies) in ["p2p", "stun", "turn"].into_iter().zip(limited) {
+                let stream =
+                    stream_for_connection(Some(&settings), kind, (1280, 720), LiveQuality::Hd);
+                assert_eq!(
+                    stream.framerate,
+                    if applies {
+                        7
+                    } else if kind == "turn" {
+                        RELAY_FPS
+                    } else {
+                        DEFAULT_FPS
+                    },
+                    "scope: {scope:?}, connection: {kind}"
+                );
+                assert_eq!(
+                    stream.width,
+                    if applies || kind == "turn" { 640 } else { 1280 },
+                    "scope: {scope:?}, connection: {kind}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_defaults_follow_the_established_connection() {
+        for kind in ["p2p", "stun"] {
+            assert_eq!(
+                stream_for_connection(None, kind, (1280, 720), LiveQuality::Hd).width,
+                1280
+            );
+        }
+        for kind in ["turn", "unknown"] {
+            assert_eq!(
+                stream_for_connection(None, kind, (1280, 720), LiveQuality::Hd).width,
+                640
+            );
+        }
+        assert_eq!(
+            stream_for_connection(None, "p2p", (640, 480), LiveQuality::Hd).width,
+            640
+        );
+    }
+
+    #[test]
+    fn configured_fhd_default_respects_capture_size_and_scoped_limits() {
+        let turn_limit = proto::VideoSettings {
+            video_quality: VideoQuality::Sd as i32,
+            video_fps: 10,
+            apply_scope: ApplyScope::Turn as i32,
+            ..Default::default()
+        };
+        for kind in ["p2p", "stun"] {
+            let stream =
+                stream_for_connection(Some(&turn_limit), kind, (1920, 1080), LiveQuality::Fhd);
+            assert_eq!(
+                (stream.width, stream.height, stream.bitrate),
+                (1920, 1080, 6_500_000)
+            );
+            assert_eq!(stream.framerate, DEFAULT_FPS);
+            let capped = stream_for_connection(None, kind, (1280, 720), LiveQuality::Fhd);
+            assert_eq!((capped.width, capped.height), (1280, 720));
+        }
+        for kind in ["turn", "unknown"] {
+            let stream =
+                stream_for_connection(Some(&turn_limit), kind, (1920, 1080), LiveQuality::Fhd);
+            assert_eq!(
+                (stream.width, stream.height, stream.framerate),
+                (640, 360, 10)
+            );
+            assert_eq!(
+                stream_for_connection(None, kind, (1920, 1080), LiveQuality::Fhd).width,
+                640
+            );
+        }
+        let all_limit = proto::VideoSettings {
+            apply_scope: ApplyScope::Any as i32,
+            ..turn_limit
+        };
+        assert_eq!(
+            stream_for_connection(Some(&all_limit), "p2p", (1920, 1080), LiveQuality::Fhd).width,
+            640
+        );
+        assert_eq!(
+            stream_for_connection(None, "p2p", (1920, 1080), LiveQuality::Sd).width,
+            640
         );
     }
 

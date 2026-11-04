@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 use super::proto::{self, ClientType, MessageType, StreamStatus, Toggle, WebrtcMode, ack};
 use super::session::{self, Command, Outgoing, Session};
 use super::socketio::{self, Packet, Writer};
-use crate::config::Token;
-use crate::source::rpicam::Rpicam;
+use crate::config::{LiveQuality, Token};
+use crate::source::process::CameraSource;
 
 /// The origin Prusa's browser webcam connects from.
 const ORIGIN: &str = "https://camera-service-webcam.prusa3d.com";
@@ -36,7 +36,8 @@ pub struct Camera {
     pub resolution: (u32, u32),
     /// The size of the sensor mode live view reads.
     pub sensor_size: (u32, u32),
-    pub source: Rpicam,
+    pub live_quality: LiveQuality,
+    pub source: CameraSource,
 }
 
 /// Keeps the camera connected to signaling, reconnecting with backoff, forever.
@@ -314,6 +315,7 @@ impl Signaling<'_> {
             request,
             camera: self.camera.source.clone(),
             sensor_size: self.camera.sensor_size,
+            live_quality: self.camera.live_quality,
             out: self.out.clone(),
             commands: receiver,
         }));

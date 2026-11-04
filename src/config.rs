@@ -40,18 +40,59 @@ pub struct CameraConfig {
     pub printer_check: Option<String>,
     /// File holding the Prusa Connect token. Defaults to the systemd credential named after `id`.
     pub token_file: Option<PathBuf>,
-    /// Offer live view in Prusa Connect. Needs a "Web camera" token and the rpicam source;
+    /// Offer live view in Prusa Connect. Needs a "Web camera" token and a camera source;
     /// snapshots pause while someone watches.
     #[serde(default)]
     pub live: bool,
+    /// Default live quality for direct connections when signaling has no applicable settings.
+    #[serde(default)]
+    pub live_quality: LiveQuality,
     pub source: SourceConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveQuality {
+    Sd,
+    #[default]
+    Hd,
+    Fhd,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SourceConfig {
     Rpicam(RpicamConfig),
+    Usb(UsbConfig),
     File(FileConfig),
+}
+
+/// A Linux V4L2 webcam captured by FFmpeg. MJPEG is copied without re-encoding snapshots.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsbConfig {
+    pub command: String,
+    /// Prefer /dev/v4l/by-id/... when several webcams are connected.
+    pub device: String,
+    /// Pick a size and frame rate advertised by v4l2-ctl --list-formats-ext.
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+    /// FFmpeg input format: usually mjpeg or yuyv422. Empty lets FFmpeg choose.
+    pub input_format: String,
+}
+
+impl Default for UsbConfig {
+    fn default() -> Self {
+        Self {
+            command: "ffmpeg".into(),
+            device: "/dev/video0".into(),
+            width: 640,
+            height: 480,
+            framerate: 15,
+            input_format: "mjpeg".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -121,7 +162,7 @@ impl Default for RpicamConfig {
 }
 
 /// Serves the same JPEG for every upload, for testing away from a Pi.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     pub path: PathBuf,
@@ -202,10 +243,23 @@ impl Config {
                     rpicam.live_mode.is_empty() || parse_mode(&rpicam.live_mode).is_some(),
                     "camera {id}: live_mode must be WIDTH:HEIGHT, e.g. \"1640:1232\""
                 );
+            } else if let SourceConfig::Usb(usb) = &camera.source {
+                ensure!(
+                    !usb.command.trim().is_empty() && !usb.device.trim().is_empty(),
+                    "camera {id}: USB command and device must not be empty"
+                );
+                ensure!(
+                    usb.width >= 2 && usb.height >= 2,
+                    "camera {id}: USB width and height must be at least 2"
+                );
+                ensure!(
+                    usb.framerate > 0,
+                    "camera {id}: USB framerate must be above 0"
+                );
             } else {
                 ensure!(
                     !camera.live,
-                    "camera {id}: live view needs the rpicam source"
+                    "camera {id}: live view needs the rpicam or usb source"
                 );
             }
         }
@@ -320,6 +374,73 @@ mod tests {
         assert_eq!(config.live_sensor_size(), (2304, 1296));
         config.live_mode = String::new();
         assert_eq!(config.live_sensor_size(), (2048, 1536));
+    }
+
+    #[test]
+    fn usb_defaults_and_live_view_are_valid() {
+        let config =
+            parse("[[camera]]\nid = \"usb0\"\nlive = true\nsource = { type = \"usb\" }").unwrap();
+        let SourceConfig::Usb(usb) = &config.camera(None).unwrap().source else {
+            panic!("expected USB")
+        };
+        assert_eq!(usb.device, "/dev/video0");
+        assert_eq!(usb.command, "ffmpeg");
+        assert_eq!((usb.width, usb.height, usb.framerate), (640, 480, 15));
+        assert_eq!(usb.input_format, "mjpeg");
+        assert_eq!(config.camera(None).unwrap().live_quality, LiveQuality::Hd);
+    }
+
+    #[test]
+    fn parses_live_quality_and_rejects_unknown_presets() {
+        for (value, expected) in [
+            ("sd", LiveQuality::Sd),
+            ("hd", LiveQuality::Hd),
+            ("fhd", LiveQuality::Fhd),
+        ] {
+            let config = parse(&format!(
+                "[[camera]]\nid = 'cam0'\nlive = true\nlive_quality = '{value}'\nsource = {{ type = 'usb' }}"
+            )).unwrap();
+            assert_eq!(config.camera(None).unwrap().live_quality, expected);
+        }
+        assert!(
+            parse("[[camera]]\nid = 'cam0'\nlive_quality = '1080p'\nsource = { type = 'usb' }")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_bad_usb_settings() {
+        for setting in [
+            "width = 0",
+            "height = 1",
+            "framerate = 0",
+            "device = ''",
+            "command = ''",
+            "bogus = 1",
+        ] {
+            assert!(
+                parse(&format!(
+                    "[[camera]]\nid = \"usb0\"\nsource = {{ type = \"usb\", {setting} }}"
+                ))
+                .is_err(),
+                "accepted {setting}"
+            );
+        }
+    }
+
+    #[test]
+    fn supports_usb_and_csi_in_the_same_config() {
+        let config = parse(
+            "[[camera]]\nid = \"usb0\"\nsource = { type = \"usb\", input_format = \"yuyv422\" }\n\
+             [[camera]]\nid = \"csi0\"\nlive = true\nsource = { type = \"rpicam\" }",
+        )
+        .unwrap();
+        assert_eq!(config.cameras.len(), 2);
+        assert!(matches!(
+            &config.camera(Some("csi0")).unwrap().source,
+            SourceConfig::Rpicam(_)
+        ));
+        assert!(parse("[[camera]]\nid = \"file0\"\nlive = true\nsource = { type = \"file\", path = \"test.jpg\" }").is_err());
     }
 
     #[test]

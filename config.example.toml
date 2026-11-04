@@ -20,6 +20,9 @@ interval = 15
 # Offer live view in Prusa Connect. Needs a token from "Add web camera" rather than "Add new
 # other camera". Snapshots pause while someone watches.
 # live = false
+# Default live quality for direct connections: "sd", "hd" (default), or "fhd" (1080p
+# with a 16:9 capture mode at least 1920 pixels wide). Scoped signaling limits still apply.
+# live_quality = "hd"
 
 [camera.source]
 type = "rpicam"
@@ -43,6 +46,20 @@ type = "rpicam"
 #                         # rpicam-vid choose, which can crop the view
 # extra_args = ["--denoise", "cdn_off"]
 # command = "rpicam-vid"  # "libcamera-vid" on releases before Bookworm
+
+# For a USB webcam, replace the [camera.source] section above with:
+#   [camera.source]
+#   type = "usb"
+#   device = "/dev/video0"  # or a stable /dev/v4l/by-id/... path
+#   width = 640
+#   height = 480
+#   framerate = 15         # must be a capture mode supported by the webcam
+#   input_format = "mjpeg" # copies camera JPEGs; use "yuyv422" for a raw-only webcam
+#   command = "ffmpeg"
+# Install: sudo apt install ffmpeg v4l-utils
+# Find cameras: v4l2-ctl --list-devices
+# Find modes: v4l2-ctl --device /dev/video0 --list-formats-ext
+# USB live view uses software H.264 encoding. Start with live = false on a Pi 2.
 
 # A second camera, e.g. on a Pi 5 or Compute Module with two camera ports:
 # [[camera]]
