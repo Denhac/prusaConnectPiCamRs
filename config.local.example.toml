@@ -1,0 +1,25 @@
+# A self-hosted prusa-connect server as an output, in addition to (or instead of) Prusa Connect.
+# Install it as /etc/prusa-connect-camera/conf.d/local.toml; `deploy/deploy.sh add-local` writes
+# one for you. Each *.toml file in conf.d/ adds outputs, so deleting the file removes them.
+#
+# On the server: declare the camera as a generic camera with no snapshot address, give the bot's
+# service account the operator role on it, and mint a token for that account with the operate
+# scope. The token goes in /etc/prusa-connect-camera/credentials/<camera id>-<output id>, here
+# cam0-local.
+
+[[output]]
+type = "connect-local"
+# Names this output in logs and its credential. Give each server its own.
+id = "local"
+# The server's address. An http:// address needs insecure_http = true and sends the token
+# unencrypted, so keep it for a test server.
+url = "https://connect.example.org"
+# The camera's name on that server.
+server_camera = "camera-pi-5"
+# Seconds between uploads.
+# interval = 15
+# Which [[camera]] to send; needed only when the config has several.
+# camera = "cam0"
+# Read the token from a file instead of the credential, e.g. when testing by hand.
+# token_file = "/home/pi/local.token"
+# insecure_http = false

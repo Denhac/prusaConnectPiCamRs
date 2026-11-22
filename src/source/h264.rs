@@ -1,7 +1,9 @@
 //! Splits the H.264 byte stream (Annex B) that `rpicam-vid --codec h264 -o -` writes into
-//! access units, one per frame, ready to send over WebRTC.
+//! access units, one per frame, as the encoder made them. An output that needs them changed,
+//! such as Prusa Connect's fixed profile, changes its own copy.
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
+const NAL_IDR: u8 = 5;
 const NAL_SEI: u8 = 6;
 const NAL_SPS: u8 = 7;
 const NAL_AUD: u8 = 9;
@@ -45,12 +47,9 @@ impl AccessUnits {
         units
     }
 
-    fn add_nal(&mut self, mut nal: Vec<u8>) -> Option<Vec<u8>> {
+    fn add_nal(&mut self, nal: Vec<u8>) -> Option<Vec<u8>> {
         let nal_type = *nal.first()? & 0x1f;
         let finished = self.finish_if(starts_access_unit(&nal));
-        if nal_type == NAL_SPS {
-            patch_sps(&mut nal);
-        }
         if self.current.len() + nal.len() > MAX_ACCESS_UNIT {
             self.current.clear();
             self.has_picture = false;
@@ -89,12 +88,32 @@ fn starts_access_unit(nal: &[u8]) -> bool {
     is_slice(nal_type) && nal.get(1).is_some_and(|b| b & 0x80 != 0)
 }
 
-/// Rewrites the SPS to constrained baseline level 3.1 (`42e01f`), the profile offered in SDP.
-/// Prusa's answerer rejects other profiles, and rpicam-vid's baseline stream decodes the same.
-fn patch_sps(nal: &mut [u8]) {
-    if let Some(header) = nal.get_mut(1..4) {
-        header.copy_from_slice(&[0x42, 0xe0, 0x1f]);
-    }
+/// The offsets in an Annex B access unit of each NAL unit's header byte, with its type.
+pub fn nal_units(unit: &[u8]) -> impl Iterator<Item = (usize, u8)> + '_ {
+    unit.windows(4)
+        .enumerate()
+        .filter(|(_, w)| w[..3] == [0, 0, 1])
+        .map(|(i, w)| (i + 3, w[3] & 0x1f))
+}
+
+/// The NAL units of an Annex B access unit, each without its start code.
+pub fn nals(unit: &[u8]) -> Vec<&[u8]> {
+    let headers: Vec<usize> = nal_units(unit).map(|(offset, _)| offset).collect();
+    headers
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let end = headers.get(i + 1).map_or(unit.len(), |&next| next - 3);
+            trim_trailing_zeros(&unit[start..end])
+        })
+        .filter(|nal| !nal.is_empty())
+        .collect()
+}
+
+/// Whether a decoder can start at this access unit: it holds an IDR slice, or the SPS that
+/// precedes one.
+pub fn is_keyframe(unit: &[u8]) -> bool {
+    nal_units(unit).any(|(_, nal_type)| matches!(nal_type, NAL_IDR | NAL_SPS))
 }
 
 fn find_start_code(buf: &[u8], from: usize) -> Option<usize> {
@@ -131,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_nal_units_into_frames_and_patches_sps() {
+    fn groups_nal_units_into_frames() {
         for chunk in [1, 2, 5, 1000] {
             let mut splitter = AccessUnits::default();
             let units: Vec<_> = stream()
@@ -142,13 +161,23 @@ mod tests {
             assert_eq!(
                 units[0],
                 [
-                    nal(&[0x27, 0x42, 0xe0, 0x1f, 0xaa]),
+                    nal(&[0x27, 0x42, 0x80, 0x29, 0xaa]),
                     nal(&[0x28, 0xce, 0x3c, 0x80]),
                     nal(&[0x25, 0x88, 0x84, 0x00, 0x11]),
                 ]
                 .concat()
             );
             assert_eq!(units[1], nal(&[0x21, 0x9a, 0x02, 0x03]));
+            assert!(is_keyframe(&units[0]));
+            assert!(!is_keyframe(&units[1]));
+            assert_eq!(
+                nals(&units[0]),
+                [
+                    &[0x27, 0x42, 0x80, 0x29, 0xaa][..],
+                    &[0x28, 0xce, 0x3c, 0x80],
+                    &[0x25, 0x88, 0x84, 0x00, 0x11],
+                ]
+            );
         }
     }
 

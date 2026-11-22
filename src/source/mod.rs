@@ -17,7 +17,8 @@ use crate::config::SourceConfig;
 /// Long enough for rpicam-vid to start and let exposure settle at a low frame rate.
 pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub trait FrameSource: Send {
+/// Shared by every output of a camera, each calling `capture` on its own schedule.
+pub trait FrameSource: Send + Sync {
     /// Returns a JPEG captured after this call started, waiting at most `timeout`. Fails with
     /// [`Paused`] while someone watches live view.
     fn capture(&self, timeout: Duration) -> Result<Arc<[u8]>>;
@@ -35,9 +36,9 @@ impl fmt::Display for Paused {
 
 impl std::error::Error for Paused {}
 
-pub fn open(config: &SourceConfig) -> Result<Box<dyn FrameSource>> {
+pub fn open(config: &SourceConfig) -> Result<Arc<dyn FrameSource>> {
     Ok(match config {
-        SourceConfig::Rpicam(config) => Box::new(rpicam::Rpicam::start(config)?),
-        SourceConfig::File(config) => Box::new(file::FileSource::new(&config.path)),
+        SourceConfig::Rpicam(config) => Arc::new(rpicam::Rpicam::start(config)?),
+        SourceConfig::File(config) => Arc::new(file::FileSource::new(&config.path)),
     })
 }

@@ -1,14 +1,20 @@
 use std::collections::HashSet;
-use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
+pub use crate::outputs::OutputConfig;
+pub use crate::secret::Token;
+
 /// Prusa Connect accepts at most one snapshot per camera this often.
 pub const MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The directory beside the config file whose `*.toml` files add outputs, read in name order.
+pub const DROP_IN_DIR: &str = "conf.d";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +29,23 @@ pub struct Config {
     pub state_dir: PathBuf,
     #[serde(rename = "camera", default)]
     pub cameras: Vec<CameraConfig>,
+    /// Where pictures go besides Prusa Connect, from this file and the drop-ins in `conf.d/`.
+    #[serde(rename = "output", default)]
+    pub outputs: Vec<OutputConfig>,
+    /// Live video over RTSP, for the cameras with video. In this file or one drop-in.
+    #[serde(default)]
+    pub rtsp: Option<crate::outputs::rtsp::Config>,
+}
+
+/// A drop-in file in `conf.d/`. It only adds outputs, so a deploy can add or remove one by
+/// writing or deleting a whole file, and an older program, which doesn't read them, is unaffected.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DropIn {
+    #[serde(rename = "output", default)]
+    outputs: Vec<OutputConfig>,
+    #[serde(default)]
+    rtsp: Option<crate::outputs::rtsp::Config>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,7 +55,11 @@ pub struct CameraConfig {
     pub id: String,
     /// Camera name shown in Prusa Connect, set on startup when present.
     pub name: Option<String>,
-    /// Seconds between uploads.
+    /// Upload to Prusa Connect (connect.prusa3d.com), configured by the settings below. Off for a
+    /// camera that only feeds its other outputs.
+    #[serde(default = "default_true")]
+    pub cloud: bool,
+    /// Seconds between uploads to Prusa Connect.
     #[serde(default = "default_interval")]
     pub interval: u64,
     /// `host:port` that must accept a TCP connection before each upload, such as the
@@ -139,16 +166,31 @@ fn default_state_dir() -> PathBuf {
     "/var/lib/prusa-connect-camera".into()
 }
 
-fn default_interval() -> u64 {
+pub fn default_interval() -> u64 {
     15
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Whether `id` is fit to name a camera or an output: it ends up in file and credential names.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 impl Config {
+    /// Reads the config file and the drop-ins in the `conf.d` directory beside it.
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let config: Config =
+        let mut config: Config =
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        let dir = path.parent().unwrap_or(Path::new(".")).join(DROP_IN_DIR);
+        load_drop_ins(&dir, &mut config)?;
         config.validate()?;
         Ok(config)
     }
@@ -162,13 +204,19 @@ impl Config {
         for camera in &self.cameras {
             let id = &camera.id;
             ensure!(
-                !id.is_empty()
-                    && id
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                valid_id(id),
                 "camera id {id:?} may only contain letters, digits, '-' and '_'"
             );
             ensure!(ids.insert(id), "camera id {id:?} is used more than once");
+            ensure!(
+                camera.cloud || self.outputs_for(id).next().is_some(),
+                "camera {id}: cloud = false and no [[output]] uses it, so it has nowhere to send \
+                 pictures"
+            );
+            ensure!(
+                camera.cloud || !camera.live,
+                "camera {id}: live = true is live view in Prusa Connect, which needs cloud = true"
+            );
             ensure!(
                 camera.interval >= MIN_INTERVAL.as_secs(),
                 "camera {id}: interval must be at least {} seconds",
@@ -209,7 +257,52 @@ impl Config {
                 );
             }
         }
+        if let Some(rtsp) = &self.rtsp {
+            rtsp.validate()?;
+            ensure!(
+                self.cameras
+                    .iter()
+                    .any(|c| matches!(c.source, SourceConfig::Rpicam(_))),
+                "rtsp: no camera has video; it needs the rpicam source"
+            );
+        }
+        let mut outputs = HashSet::new();
+        for output in &self.outputs {
+            let camera = self.camera_of(output)?;
+            output.validate()?;
+            ensure!(
+                outputs.insert((camera, output.id())),
+                "camera {camera} has two outputs with id {:?}; give one of them another id",
+                output.id()
+            );
+        }
         Ok(())
+    }
+
+    /// The id of the camera whose pictures `output` sends: the one it names, or the only camera.
+    fn camera_of<'a>(&'a self, output: &'a OutputConfig) -> Result<&'a str> {
+        match (output.camera(), self.cameras.as_slice()) {
+            (Some(id), cameras) => {
+                ensure!(
+                    cameras.iter().any(|c| c.id == id),
+                    "an [[output]] names camera {id:?}, which isn't in the config"
+                );
+                Ok(id)
+            }
+            (None, [only]) => Ok(&only.id),
+            (None, _) => bail!(
+                "an [[output]] of type {} has no camera; with several cameras, each output names \
+                 one with camera = \"<id>\"",
+                output.kind()
+            ),
+        }
+    }
+
+    /// The outputs that send pictures from camera `id`. Call only after validation.
+    pub fn outputs_for<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a OutputConfig> {
+        self.outputs
+            .iter()
+            .filter(move |output| self.camera_of(output).is_ok_and(|camera| camera == id))
     }
 
     /// Picks a camera by id, or the only camera when `id` is `None`.
@@ -236,48 +329,49 @@ impl CameraConfig {
         Duration::from_secs(self.interval)
     }
 
+    /// The Prusa Connect token: `token_file`, or the systemd credential named after the camera.
     pub fn load_token(&self) -> Result<Token> {
-        let path = match &self.token_file {
-            Some(path) => path.clone(),
-            None => {
-                let dir = std::env::var_os("CREDENTIALS_DIRECTORY").with_context(|| {
-                    format!(
-                        "camera {0}: no token_file is set and no systemd credentials were passed \
-                         (LoadCredential={0}:/path/to/token)",
-                        self.id
-                    )
-                })?;
-                PathBuf::from(dir).join(&self.id)
-            }
-        };
-        let text = fs::read_to_string(&path).with_context(|| {
-            format!("camera {}: reading token from {}", self.id, path.display())
-        })?;
-        let token = text.trim();
-        ensure!(
-            !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic()),
-            "camera {}: the token in {} is empty or has invalid characters",
-            self.id,
-            path.display()
-        );
-        Ok(Token(token.to_owned()))
+        crate::secret::load(
+            &format!("camera {}", self.id),
+            &self.id,
+            self.token_file.as_deref(),
+        )
     }
 }
 
-/// A Prusa Connect camera token. `Debug` is redacted so it can't end up in logs.
-#[derive(Clone)]
-pub struct Token(String);
-
-impl Token {
-    pub fn as_str(&self) -> &str {
-        &self.0
+/// Adds the `*.toml` drop-ins in `dir` to `config`, in name order. A missing directory has none.
+fn load_drop_ins(dir: &Path, config: &mut Config) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading {}", dir.display()))?
+            .path();
+        if path.extension().is_some_and(|ext| ext == "toml") {
+            paths.push(path);
+        }
     }
-}
-
-impl fmt::Debug for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Token(<redacted>)")
+    paths.sort();
+    for path in paths {
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let drop_in: DropIn =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        config.outputs.extend(drop_in.outputs);
+        if drop_in.rtsp.is_some() {
+            ensure!(
+                config.rtsp.is_none(),
+                "{}: [rtsp] is set in more than one file",
+                path.display()
+            );
+            config.rtsp = drop_in.rtsp;
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -380,5 +474,83 @@ mod tests {
         assert_eq!(config.camera(Some("b")).unwrap().id, "b");
         assert!(config.camera(None).is_err());
         assert!(config.camera(Some("c")).is_err());
+    }
+
+    const ONE_CAMERA: &str = "[[camera]]\nid = \"cam0\"\nsource = { type = \"rpicam\" }\n";
+    const LOCAL: &str = "[[output]]\ntype = \"connect-local\"\n\
+                         url = \"https://connect.example.org\"\nserver_camera = \"bot\"\n";
+
+    /// Writes a config file and drop-ins to a fresh directory, and loads it.
+    fn load_with(main: &str, drop_ins: &[(&str, &str)]) -> Result<Config> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("pcc-config-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(DROP_IN_DIR)).unwrap();
+        fs::write(dir.join("config.toml"), main).unwrap();
+        for (name, text) in drop_ins {
+            fs::write(dir.join(DROP_IN_DIR).join(name), text).unwrap();
+        }
+        let result = Config::load(&dir.join("config.toml"));
+        fs::remove_dir_all(dir).unwrap();
+        result
+    }
+
+    #[test]
+    fn reads_outputs_from_drop_ins_in_name_order() {
+        let second = LOCAL.replace("bot", "other") + "id = \"test\"\n";
+        let config = load_with(
+            ONE_CAMERA,
+            &[
+                ("20-test.toml", &second),
+                ("10-local.toml", LOCAL),
+                ("notes.txt", "ignored"),
+            ],
+        )
+        .unwrap();
+        let ids: Vec<_> = config.outputs_for("cam0").map(|o| o.id()).collect();
+        assert_eq!(ids, ["local", "test"]);
+        assert!(config.cameras[0].cloud);
+    }
+
+    #[test]
+    fn the_example_drop_in_is_valid() {
+        let config = load_with(
+            ONE_CAMERA,
+            &[("local.toml", include_str!("../config.local.example.toml"))],
+        )
+        .unwrap();
+        assert_eq!(config.outputs_for("cam0").count(), 1);
+    }
+
+    #[test]
+    fn checks_outputs() {
+        // A camera may leave Prusa Connect out, but then needs another output.
+        let local_only = ONE_CAMERA.replace("id = \"cam0\"", "id = \"cam0\"\ncloud = false");
+        assert!(load_with(&local_only, &[("local.toml", LOCAL)]).is_ok());
+        assert!(load_with(&local_only, &[]).is_err());
+        // Live view in Prusa Connect needs Prusa Connect.
+        let live = local_only.replace("cloud = false", "cloud = false\nlive = true");
+        assert!(load_with(&live, &[("local.toml", LOCAL)]).is_err());
+        // Two outputs of one camera need different ids.
+        assert!(load_with(ONE_CAMERA, &[("a.toml", LOCAL), ("b.toml", LOCAL)]).is_err());
+        // With several cameras, an output names its camera, and it must exist.
+        let two = format!("{ONE_CAMERA}{}", ONE_CAMERA.replace("cam0", "cam1"));
+        assert!(load_with(&two, &[("local.toml", LOCAL)]).is_err());
+        let named = format!("{LOCAL}camera = \"cam1\"\n");
+        let config = load_with(&two, &[("local.toml", &named)]).unwrap();
+        assert_eq!(config.outputs_for("cam1").count(), 1);
+        assert_eq!(config.outputs_for("cam0").count(), 0);
+        let missing = format!("{LOCAL}camera = \"cam9\"\n");
+        assert!(load_with(&two, &[("local.toml", &missing)]).is_err());
+        // Drop-ins hold outputs only, and unknown keys and types are errors.
+        assert!(load_with(ONE_CAMERA, &[("x.toml", ONE_CAMERA)]).is_err());
+        assert!(load_with(ONE_CAMERA, &[("x.toml", &format!("{LOCAL}bogus = 1\n"))]).is_err());
+        let unknown = LOCAL.replace("connect-local", "smoke-signals");
+        assert!(load_with(ONE_CAMERA, &[("x.toml", &unknown)]).is_err());
+        let http = LOCAL.replace("https://", "http://");
+        assert!(load_with(ONE_CAMERA, &[("x.toml", &http)]).is_err());
+        let insecure = format!("{http}insecure_http = true\n");
+        assert!(load_with(ONE_CAMERA, &[("x.toml", &insecure)]).is_ok());
     }
 }

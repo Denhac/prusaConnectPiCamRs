@@ -33,11 +33,15 @@ use webrtc::peer_connection::{
 use webrtc::rtp_transceiver::RtpSender;
 
 use super::proto::{self, ApplyScope, ConnectionType, IcePolicy, VideoQuality};
-use crate::source::rpicam::{LiveStream, Rpicam};
+use crate::hub::{Caps, Hub, Subscription};
+use crate::source::h264::nal_units;
 
 const PAYLOAD_TYPE: u8 = 102;
 /// The profile Prusa Connect's viewers accept; the camera's SPS is patched to match.
 const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+/// The SPS bytes after its NAL header that say `42e01f`: profile, constraints and level.
+const SPS_PROFILE: [u8; 3] = [0x42, 0xe0, 0x1f];
+const NAL_SPS: u8 = 7;
 /// Frame rate when the viewer doesn't ask for one, as in Prusa's webcam.
 const DEFAULT_FPS: u32 = 12;
 /// Frame rate for relayed streams without video settings, as in Prusa's webcam.
@@ -102,9 +106,8 @@ pub struct Session {
     /// Held until the session has finished, so shutdown can wait for it.
     pub _alive: mpsc::Sender<()>,
     pub request: proto::Webrtc,
-    pub camera: Rpicam,
-    /// The size of the sensor mode live view reads, which gives its streams their shape.
-    pub sensor_size: (u32, u32),
+    /// The camera's video, shared with its other viewers.
+    pub hub: Hub,
     pub out: mpsc::Sender<Outgoing>,
     /// Closed by signaling to end the session.
     pub commands: mpsc::Receiver<Command>,
@@ -142,18 +145,6 @@ pub async fn run(mut session: Session) {
     let _ = out.send(Outgoing::Closed { request_id, serial }).await;
 }
 
-/// Hands the camera back to snapshots when a session ends, however it ends.
-struct LiveGuard {
-    camera: Rpicam,
-    id: u64,
-}
-
-impl Drop for LiveGuard {
-    fn drop(&mut self) {
-        self.camera.stop_live(self.id);
-    }
-}
-
 /// Stops a spawned task when dropped.
 struct TaskGuard(tokio::task::JoinHandle<Result<()>>);
 
@@ -163,32 +154,44 @@ impl Drop for TaskGuard {
     }
 }
 
-/// The stream to encode for a request: the widths and bitrates of Prusa's webcam presets, with
-/// the sensor mode's shape so nothing is cropped, and never wider than the mode itself.
-pub fn stream_for(
-    settings: Option<&proto::VideoSettings>,
-    relay_only: bool,
-    (sensor_width, sensor_height): (u32, u32),
-) -> LiveStream {
+/// What a request asks of the stream: the widths and bitrates of Prusa's webcam presets. The hub
+/// gives the stream the sensor mode's shape, and may run it lower for another viewer.
+pub fn caps_for(settings: Option<&proto::VideoSettings>, relay_only: bool) -> Caps {
     let (quality, framerate) = match settings {
         Some(s) => (s.video_quality(), Some(s.video_fps).filter(|&fps| fps > 0)),
         None if relay_only => (VideoQuality::Sd, Some(RELAY_FPS)),
         None => (VideoQuality::Hd, None),
     };
-    let (width, bitrate) = match quality {
+    let (max_width, max_bitrate) = match quality {
         VideoQuality::Sd => (640, 900_000),
         VideoQuality::Fhd => (1920, 6_500_000),
         VideoQuality::Hd | VideoQuality::Invalid => (1280, 2_500_000),
     };
-    let width = width.min(sensor_width);
-    let height = u64::from(width) * u64::from(sensor_height) / u64::from(sensor_width);
-    LiveStream {
-        // The H.264 encoder needs even dimensions.
-        width: width & !1,
-        height: height as u32 & !1,
-        framerate: framerate.unwrap_or(DEFAULT_FPS),
-        bitrate,
+    Caps {
+        max_width,
+        max_fps: framerate.unwrap_or(DEFAULT_FPS),
+        max_bitrate,
     }
+}
+
+/// Rewrites the SPS in an access unit to constrained baseline level 3.1 (`42e01f`), the profile
+/// the session offers in SDP: Prusa's answerer rejects any other, and rpicam-vid's baseline
+/// stream decodes the same. A unit without an SPS, all but about one a second, is returned as is.
+fn patch_sps(unit: Bytes) -> Bytes {
+    let headers: Vec<usize> = nal_units(&unit)
+        .filter(|&(_, nal_type)| nal_type == NAL_SPS)
+        .map(|(offset, _)| offset)
+        .collect();
+    if headers.is_empty() {
+        return unit;
+    }
+    let mut patched = unit.to_vec();
+    for header in headers {
+        if let Some(profile) = patched.get_mut(header + 1..header + 4) {
+            profile.copy_from_slice(&SPS_PROFILE);
+        }
+    }
+    patched.into()
 }
 
 async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
@@ -196,14 +199,13 @@ async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
     let ice = s.request.ice_configuration.clone().unwrap_or_default();
     let video = s.request.video_settings.clone();
     let relay_only = ice.ice_transport_policy() == IcePolicy::Relay;
-    let stream = stream_for(video.as_ref(), relay_only, s.sensor_size);
+    let caps = caps_for(video.as_ref(), relay_only);
     log::info!(
-        "[{}] live view requested: {}x{} at {} fps, {} kbit/s{}",
+        "[{}] live view requested: up to {} wide at {} fps, {} kbit/s{}",
         s.camera_id,
-        stream.width,
-        stream.height,
-        stream.framerate,
-        stream.bitrate / 1000,
+        caps.max_width,
+        caps.max_fps,
+        caps.max_bitrate / 1000,
         if relay_only { ", relayed" } else { "" }
     );
 
@@ -281,7 +283,7 @@ async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
         s,
         &pc,
         &mut state_changes,
-        stream,
+        caps,
         video.as_ref(),
         &candidates,
         connected,
@@ -297,7 +299,7 @@ async fn drive(
     s: &mut Session,
     pc: &impl PeerConnection,
     state_changes: &mut mpsc::Receiver<RTCPeerConnectionState>,
-    stream: LiveStream,
+    caps: Caps,
     video: Option<&proto::VideoSettings>,
     candidates: &Mutex<Candidates>,
     connected: &mut bool,
@@ -340,9 +342,7 @@ async fn drive(
         })
         .await?;
 
-    // Locals drop in reverse order, so when the session ends the sending stops first, then the
-    // camera goes back to snapshots.
-    let mut _live: Option<LiveGuard> = None;
+    // The sending task holds the session's subscription to the hub, so stopping it unsubscribes.
     let mut media: Option<TaskGuard> = None;
     let mut ttl_deadline: Option<tokio::time::Instant> = None;
     let mut disconnected_deadline: Option<tokio::time::Instant> = None;
@@ -377,13 +377,11 @@ async fn drive(
                         })
                         .await?;
                     if media.is_none() {
-                        let live = s.camera.start_live(stream);
-                        _live = Some(LiveGuard { camera: s.camera.clone(), id: live.id });
                         media = Some(TaskGuard(tokio::spawn(send_frames(
                             Arc::clone(&track),
                             Arc::clone(&sender),
-                            live.frames,
-                            stream.framerate,
+                            s.hub.subscribe(caps),
+                            caps.max_fps,
                         ))));
                         let (local, remote) = connection_types(pc).await;
                         let kind = connection_kind(local, remote);
@@ -452,7 +450,7 @@ async fn drive(
 async fn send_frames(
     track: Arc<TrackLocalStaticSample>,
     sender: Arc<dyn RtpSender>,
-    mut frames: mpsc::Receiver<Bytes>,
+    mut subscription: Subscription,
     framerate: u32,
 ) -> Result<()> {
     let payload_type = sender
@@ -468,20 +466,36 @@ async fn send_frames(
         .await
         .first()
         .context("the video track has no SSRC")?;
-    let duration = Duration::from_secs(1) / framerate.max(1);
+    // A sample's duration sets the next one's RTP timestamp. The stream may run at another
+    // viewer's rate, and frames may be dropped, so each frame is timed by the gap before it.
+    let mut duration = Duration::from_secs(1) / framerate.max(1);
+    let mut previous: Option<Instant> = None;
     loop {
-        let Ok(frame) = tokio::time::timeout(VIDEO_TIMEOUT, frames.recv()).await else {
+        let Ok(frame) = tokio::time::timeout(VIDEO_TIMEOUT, subscription.frames.recv()).await
+        else {
             bail!("the camera sent no video for {}s", VIDEO_TIMEOUT.as_secs());
         };
-        let Some(data) = frame else {
+        let Some(frame) = frame else {
             return Ok(());
+        };
+        if let Some(previous) = previous {
+            duration = frame
+                .captured
+                .saturating_duration_since(previous)
+                .min(Duration::from_secs(1));
+        }
+        previous = Some(frame.captured);
+        let data = if frame.keyframe {
+            patch_sps(frame.data)
+        } else {
+            frame.data
         };
         track
             .sample_writer(ssrc, payload_type)
             .write_sample(&Sample {
                 data,
                 duration,
-                ..Sample::new(Instant::now())
+                ..Sample::new(frame.captured)
             })
             .await?;
     }
@@ -707,54 +721,47 @@ fn scope_applies(scope: Option<ApplyScope>, kind: &str) -> bool {
 mod tests {
     use super::*;
 
-    const MODULE_2: (u32, u32) = (1640, 1232);
-    const MODULE_3: (u32, u32) = (2304, 1296);
-
-    fn size(quality: VideoQuality, sensor: (u32, u32)) -> (u32, u32) {
-        let settings = proto::VideoSettings {
-            video_quality: quality as i32,
-            ..Default::default()
-        };
-        let stream = stream_for(Some(&settings), false, sensor);
-        (stream.width, stream.height)
-    }
-
     #[test]
-    fn picks_stream_settings() {
+    fn asks_for_prusas_presets() {
         let fhd = proto::VideoSettings {
             video_quality: VideoQuality::Fhd as i32,
             video_fps: 24,
             ..Default::default()
         };
         assert_eq!(
-            stream_for(Some(&fhd), false, MODULE_2),
-            LiveStream {
-                width: 1640,
-                height: 1232,
-                framerate: 24,
-                bitrate: 6_500_000
+            caps_for(Some(&fhd), false),
+            Caps {
+                max_width: 1920,
+                max_fps: 24,
+                max_bitrate: 6_500_000
             }
         );
-        assert_eq!(stream_for(None, false, MODULE_2).framerate, DEFAULT_FPS);
+        assert_eq!(caps_for(None, false).max_fps, DEFAULT_FPS);
+        assert_eq!(caps_for(None, false).max_width, 1280);
         assert_eq!(
-            stream_for(None, true, MODULE_2),
-            LiveStream {
-                width: 640,
-                height: 480,
-                framerate: 10,
-                bitrate: 900_000
+            caps_for(None, true),
+            Caps {
+                max_width: 640,
+                max_fps: 10,
+                max_bitrate: 900_000
             }
         );
     }
 
     #[test]
-    fn streams_take_the_shape_of_the_sensor_mode() {
-        assert_eq!(size(VideoQuality::Sd, MODULE_2), (640, 480));
-        assert_eq!(size(VideoQuality::Hd, MODULE_2), (1280, 960));
-        assert_eq!(size(VideoQuality::Fhd, MODULE_2), (1640, 1232));
-        assert_eq!(size(VideoQuality::Sd, MODULE_3), (640, 360));
-        assert_eq!(size(VideoQuality::Hd, MODULE_3), (1280, 720));
-        assert_eq!(size(VideoQuality::Fhd, MODULE_3), (1920, 1080));
+    fn patches_only_the_sps() {
+        let unit = |sps: &[u8]| -> Bytes {
+            [
+                &[0, 0, 0, 1, 0x27][..],
+                sps,
+                &[0xaa, 0, 0, 0, 1, 0x28, 0xce, 0, 0, 1, 0x25, 0x88][..],
+            ]
+            .concat()
+            .into()
+        };
+        assert_eq!(patch_sps(unit(&[0x42, 0x80, 0x29])), unit(&SPS_PROFILE));
+        let p_frame = Bytes::from_static(&[0, 0, 0, 1, 0x21, 0x9a, 0x02]);
+        assert_eq!(patch_sps(p_frame.clone()), p_frame);
     }
 
     #[test]

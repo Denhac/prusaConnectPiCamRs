@@ -13,6 +13,11 @@ usage() {
 Usage:
   deploy/deploy.sh install HOST [--token-file FILE] [--name NAME] [--fingerprint VALUE] [--live]
   deploy/deploy.sh upgrade HOST...
+  deploy/deploy.sh add-local HOST --url URL --server-camera NAME [--id ID] [--token-file FILE]
+                             [--insecure-http]
+  deploy/deploy.sh remove-local HOST [--id ID]
+  deploy/deploy.sh rtsp HOST [--listen ADDRESS:PORT]
+  deploy/deploy.sh remove-rtsp HOST
 
 install  Sets up a Pi with its Prusa Connect camera token and a fresh config naming the
          camera NAME (default: HOST), with sizes that fit its camera. Use it for a new Pi,
@@ -23,10 +28,24 @@ install  Sets up a Pi with its Prusa Connect camera token and a fresh config nam
          Connect, which needs a token from "Add web camera".
 upgrade  Replaces the program and its systemd unit on Pis that are already installed.
          Their tokens, config and fingerprints are left alone.
+add-local
+         Also sends the Pi's pictures to a self-hosted prusa-connect server at URL, as
+         its camera NAME, with a token for the bot's service account (asked for unless
+         given --token-file). ID (default: local) names the output; use another to add a
+         second server, or the same to replace one. URL must be https, unless
+         --insecure-http allows http for a test server.
+remove-local
+         Stops sending to the server added as ID (default: local).
+rtsp     Serves the Pi's live video over RTSP at rtsp://<Pi>:8554/cam0 to anyone on a
+         private network, with no password, and prints the address to give the
+         prusa-connect server's camera as its stream address.
+remove-rtsp
+         Stops serving RTSP.
 
-Both build the program first, check each Pi has a working camera before copying
-anything, and wait for its first upload. If an upgraded program fails, the previous
-one is restored.
+Every command builds the program first, checks each Pi has a working camera before
+copying anything, installs the program, and waits for every output to upload. If the new
+version fails, the previous version and settings are put back. If it runs but an output
+can't upload, e.g. because its server is down, it stays and is listed as needing attention.
 
 Options:
   --user USER          SSH user (default: rpi)
@@ -53,6 +72,11 @@ token_file=""
 name=""
 fingerprint=""
 live=false
+url=""
+server_camera=""
+output_id=local
+insecure_http=false
+listen=0.0.0.0:8554
 build=true
 check_camera=true
 while (( $# )); do
@@ -63,6 +87,11 @@ while (( $# )); do
     --name) name=${2:?--name needs a value}; shift ;;
     --fingerprint) fingerprint=${2:?--fingerprint needs a value}; shift ;;
     --live) live=true ;;
+    --url) url=${2:?--url needs a value}; shift ;;
+    --server-camera) server_camera=${2:?--server-camera needs a value}; shift ;;
+    --id) output_id=${2:?--id needs a value}; shift ;;
+    --insecure-http) insecure_http=true ;;
+    --listen) listen=${2:?--listen needs a value}; shift ;;
     --skip-build) build=false ;;
     --skip-camera-check) check_camera=false ;;
     -*) die "unknown option: $1 (see --help)" ;;
@@ -72,13 +101,36 @@ while (( $# )); do
 done
 
 case $mode in
-  install)
-    (( ${#hosts[@]} == 1 )) || die "install takes exactly one host, since each camera has its own token"
+  install | add-local | remove-local | rtsp | remove-rtsp)
+    (( ${#hosts[@]} == 1 )) || die "$mode takes exactly one host, since each camera has its own token"
+    ;;&
+  rtsp)
+    # Checked here so the TOML written below needs no escaping; the program checks again.
+    [[ $listen =~ ^[0-9.]+:[0-9]+$ ]] || die "--listen must be an IPv4 address and port, e.g. 0.0.0.0:8554"
     ;;
+  add-local)
+    [[ -n $url && -n $server_camera ]] || die "add-local needs --url and --server-camera"
+    # Checked here too so the TOML written below needs no escaping; the program checks again.
+    [[ $url =~ ^(https?)://([A-Za-z0-9.-]+)(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] ||
+      die "--url must look like https://host[:port][/path]"
+    scheme=${BASH_REMATCH[1]} url_host=${BASH_REMATCH[2]}
+    if [[ $scheme == http ]] && ! $insecure_http; then
+      die "--url is http, which sends the token unencrypted; use https, or --insecure-http for a test server"
+    fi
+    # Pictures go over the LAN, never over Tailscale.
+    if [[ $url_host =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. || $url_host == *.ts.net ]]; then
+      die "--url is a Tailscale address; use the server's LAN name or address"
+    fi
+    [[ $server_camera =~ ^[A-Za-z0-9._-]+$ ]] || die "--server-camera may only contain letters, digits, '.', '-' and '_'"
+    ;;&
+  add-local | remove-local)
+    [[ $output_id =~ ^[A-Za-z0-9_-]+$ ]] || die "--id may only contain letters, digits, '-' and '_'"
+    ;;
+  install | remove-rtsp) ;;
   upgrade)
     (( ${#hosts[@]} > 0 )) || die "upgrade needs at least one host"
-    if [[ -n $token_file$name$fingerprint ]] || $live; then
-      die "upgrade keeps each Pi's token and config; use install to change them"
+    if [[ -n $token_file$name$fingerprint$url$server_camera ]] || $live; then
+      die "upgrade keeps each Pi's tokens and settings; use install or add-local to change them"
     fi
     ;;
   *) usage >&2; exit 2 ;;
@@ -91,11 +143,15 @@ if [[ -n ${SSHPASS:-} ]] && ! command -v sshpass >/dev/null; then
 fi
 
 token=""
-if [[ $mode == install ]]; then
+if [[ $mode == install || $mode == add-local ]]; then
   if [[ -n $token_file ]]; then
     token=$(<"$token_file")
   elif [[ -t 0 ]]; then
-    read -rsp "Prusa Connect token for ${hosts[0]}: " token
+    if [[ $mode == install ]]; then
+      read -rsp "Prusa Connect token for ${hosts[0]}: " token
+    else
+      read -rsp "Token of ${hosts[0]}'s service account on $url: " token
+    fi
     echo
   else
     die "no token: pass --token-file, or run in a terminal to be asked for it"
@@ -170,6 +226,13 @@ make_bundle() {
     printf '%s\n' "$token" >"$dir/token"
     write_config "${name:-$host}" "$live" "$sensor" <"$repo/config.example.toml" >"$dir/config.toml"
     files+=(token config.toml)
+  elif [[ $mode == add-local ]]; then
+    printf '%s\n' "$token" >"$dir/token"
+    write_output >"$dir/output.toml"
+    files+=(token output.toml)
+  elif [[ $mode == rtsp ]]; then
+    write_rtsp >"$dir/rtsp.toml"
+    files+=(rtsp.toml)
   fi
   (cd "$dir" && sha256sum -- "${files[@]}" >SHA256SUMS)
 }
@@ -203,6 +266,29 @@ write_config() {
   done
 }
 
+# The drop-in for add-local's output. Its values were checked above and need no escaping.
+write_output() {
+  printf '%s\n' \
+    "# Written by deploy/deploy.sh add-local. Its token is in the credential cam0-$output_id;" \
+    "# deploy/deploy.sh remove-local --id $output_id removes both." \
+    '[[output]]' \
+    'type = "connect-local"' \
+    "id = \"$output_id\"" \
+    "url = \"$url\"" \
+    "server_camera = \"$server_camera\""
+  if $insecure_http; then
+    printf 'insecure_http = true\n'
+  fi
+}
+
+# The drop-in for rtsp. Its value was checked above and needs no escaping.
+write_rtsp() {
+  printf '%s\n' \
+    "# Written by deploy/deploy.sh rtsp; deploy/deploy.sh remove-rtsp removes it." \
+    '[rtsp]' \
+    "listen = \"$listen\""
+}
+
 deploy_host() {
   local host=$1 bundle=$work/bundle-$1 dir args sensor status=0
   echo "==> $host: $mode"
@@ -221,6 +307,7 @@ deploy_host() {
   if tar -C "$bundle" -cf - . | remote "$host" tar -C "$dir" -xf -; then
     args="$mode"
     [[ -n $fingerprint ]] && args+=" --fingerprint $fingerprint"
+    [[ $mode == *-local ]] && args+=" --id $output_id"
     remote_sudo "$host" "bash $dir/remote.sh $args" || status=$?
   else
     status=1
@@ -232,14 +319,24 @@ deploy_host() {
 }
 
 succeeded=()
+attention=()
 failed=()
 for host in "${hosts[@]}"; do
-  if deploy_host "$host"; then succeeded+=("$host"); else failed+=("$host"); fi
+  status=0
+  deploy_host "$host" || status=$?
+  case $status in
+    0) succeeded+=("$host") ;;
+    3) attention+=("$host") ;;
+    *) failed+=("$host") ;;
+  esac
 done
 
 echo
-echo "Deployed: ${succeeded[*]:-none}"
+echo "Deployed:        ${succeeded[*]:-none}"
+if (( ${#attention[@]} > 0 )); then
+  echo "Needs attention: ${attention[*]} (running the new version; see its outputs above)"
+fi
 if (( ${#failed[@]} > 0 )); then
-  echo "Failed:   ${failed[*]}"
+  echo "Failed:          ${failed[*]}"
   exit 1
 fi

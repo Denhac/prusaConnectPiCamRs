@@ -1,7 +1,8 @@
 # prusaConnectCamera
 
 Uploads snapshots from Raspberry Pi cameras to [Prusa Connect](https://connect.prusa3d.com),
-so a printer without its own camera gets one in the Connect dashboard.
+so a printer without its own camera gets one in the Connect dashboard. It can send them to a
+[self-hosted prusa-connect server](#self-hosted-prusa-connect) at the same time.
 
 It runs as one small service per Pi. It keeps `rpicam-vid` streaming at a low frame rate and
 uploads the newest frame every 15 seconds. Because the camera stays running, exposure and white
@@ -49,9 +50,9 @@ sizes.
 
 ```shell
 # A new Pi, or a new token. Asks for the token unless given --token-file.
-deploy/deploy.sh install rpi-bot-green
+deploy/deploy.sh install camera-pi-1
 # A new program version for Pis already installed. Tokens, config and fingerprints are kept.
-deploy/deploy.sh upgrade rpi-bot-blue rpi-bot-green
+deploy/deploy.sh upgrade camera-pi-2 camera-pi-1
 ```
 
 `install` takes one Pi at a time because each camera has its own token, and it replaces that
@@ -124,7 +125,7 @@ someone watches. Snapshots pause during that time and resume afterwards.
 2. Within 15 minutes, install with live view turned on:
 
    ```shell
-   deploy/deploy.sh install rpi-bot-green --live
+   deploy/deploy.sh install camera-pi-1 --live
    ```
 
    Or set `live = true` in the camera's section of the config.
@@ -140,12 +141,83 @@ someone watches. Snapshots pause during that time and resume afterwards.
   accounts.
 - The protocol is undocumented. It follows Prusa's webcam app (version 0.3.6) and may change.
 
+## Self-hosted prusa-connect
+
+The same camera can also send its snapshots to a self-hosted
+[prusa-connect](https://github.com/prusa3d/prusa-connect) server, at the same time as Prusa
+Connect or instead of it. Tested with prusa-connect 0.1.0-beta.1, which is a beta whose API may
+still change; [docs/design/compat.md](docs/design/compat.md) lists what this relies on.
+
+On the server, as an administrator:
+
+1. Add the camera as a **generic** camera with no snapshot address, on its printer's Cameras tab
+   or with `PUT /api/v1/cameras/<name>`.
+2. Give the bot a service account of its own (`service_account:<name>`) with the **operator** role
+   on that camera: `POST /api/v1/grants/device/<camera>` with
+   `{"relation":"operator","subject":"service_account:<name>"}`.
+3. Mint a token for that account with the **operate** scope: `POST /api/v1/auth/credentials` with
+   `{"name":"…","subject":"service_account:<name>","scopes":["operate"]}`. Tokens last 90 days
+   unless `expires_at` asks for up to a year. Mint them from an administrator account kept for
+   this, since changing that account's password revokes every token it created.
+
+Then on your PC:
+
+```shell
+deploy/deploy.sh add-local camera-pi-1 --url https://connect.example.org --server-camera camera-pi-1
+```
+
+It asks for the token, adds the output as a drop-in file, `conf.d/local-local.toml`, beside the
+config, and waits for the first upload. `--id` names the output (default `local`), so one Pi can
+send to several servers; `remove-local --id ID` takes one away. An `http://` server needs
+`--insecure-http`, since the token then travels unencrypted, so keep that for a test server.
+[config.local.example.toml](config.local.example.toml) shows every setting.
+
+- Snapshots pause while anyone watches live view, here or in Prusa Connect. The server shows a
+  pushed picture for 5 minutes (the camera's `stale` setting), so a long live session blanks the
+  server's thumbnail until it ends.
+- Pictures go over the LAN, never over Tailscale: `add-local` refuses a Tailscale address, and the
+  program warns if the server's name resolves to one.
+
+### Live view on the self-hosted server (RTSP)
+
+The server plays a camera's live view from an RTSP stream. The Pi serves one:
+
+```shell
+deploy/deploy.sh rtsp camera-pi-1
+```
+
+It prints the stream address, for example `rtsp://10.0.0.174:8554/cam0`. On the server, set
+that as the camera's **stream address** (`stream_url`). The server connects only while someone
+watches. VLC, mpv or ffmpeg can play the same address.
+
+- One encoder serves every viewer at once: the server's, Prusa Connect's (up to two), and any
+  other RTSP client such as VLC or ffmpeg. It runs at the lowest quality any of them asked for,
+  so a viewer who joins with a lower setting lowers it for all, with a gap of about 1.3 s.
+  It doesn't go back up until everyone has left.
+- The server opens one RTSP session per person watching, and each is a copy of the video on the
+  Pi's network (2.5 Mbit/s at the default 1280 wide, 12 fps). `max_sessions` (default 4) caps
+  them.
+- There is no password. Anyone on a private network may watch: the LAN (10.x, 172.16-31.x,
+  192.168.x and their IPv6 equivalents), the Pi itself, and Tailscale's 100.64-127.x. Clients
+  from public internet addresses are refused, in case the port is ever forwarded. The video
+  isn't encrypted.
+- RTP goes over the RTSP connection (TCP), so no UDP ports need opening.
+- `remove-rtsp` turns it off.
+
+`prusa-connect-camera status` shows what each output of the running service is doing:
+
+```
+cam0/cloud               ok        uploading every 15s
+cam0/local               retrying  request to https://connect.example.org failed: …
+```
+
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `run` | Upload from every configured camera until stopped (what the service runs) |
-| `test` | Capture one frame, upload it, and print Prusa Connect's answer |
+| `test` | Capture one frame, send it to each output, and print what each answered |
+| `status [--wait SECS]` | Show what each output of the running service is doing |
 | `snapshot -o file.jpg` | Capture one frame and save it locally, e.g. to check framing |
 | `list-cameras` | List the cameras and sensor modes `rpicam-vid` can see |
 | `fingerprint show` / `fingerprint import <value>` | Show or set a camera's fingerprint |

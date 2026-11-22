@@ -1,6 +1,7 @@
 //! Live view in Prusa Connect. The camera registers as a Prusa "web camera" and speaks the same
-//! signaling and WebRTC protocol as Prusa's browser webcam, streaming H.264 from rpicam-vid to a
-//! viewer who presses play. Snapshots pause while someone watches.
+//! signaling and WebRTC protocol as Prusa's browser webcam, streaming the camera's H.264 from the
+//! video hub to each viewer who presses play, up to two at once. Snapshots pause while anyone,
+//! here or on another output, watches.
 //!
 //! The protocol is undocumented; it follows Prusa's webcam app (camera-service-webcam.prusa3d.com,
 //! version 0.3.6) and may change without notice.

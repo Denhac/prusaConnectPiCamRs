@@ -3,13 +3,11 @@
 //! camera's `Token` and `Fingerprint` headers.
 
 use std::fmt;
-use std::time::Duration;
 
 use ureq::Agent;
 
 use crate::config::Token;
-
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::uploader::{REJECTED_CREDENTIALS, REQUEST_TIMEOUT};
 
 pub struct Client {
     agent: Agent,
@@ -33,19 +31,13 @@ pub enum ConnectError {
     Transport(ureq::Error),
 }
 
-impl ConnectError {
-    pub fn is_auth(&self) -> bool {
-        matches!(self, ConnectError::Auth { .. })
-    }
-}
-
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConnectError::Auth { status, message } => write!(
                 f,
-                "Prusa Connect rejected the camera's credentials (HTTP {status}: {message}); check \
-                 the token, and that the fingerprint is the one this camera was first registered with"
+                "Prusa Connect {REJECTED_CREDENTIALS} (HTTP {status}: {message}); check the token, \
+                 and that the fingerprint is the one this camera was first registered with"
             ),
             ConnectError::Status { status, message } => {
                 write!(f, "Prusa Connect answered HTTP {status}: {message}")
@@ -83,10 +75,6 @@ impl Client {
         }
     }
 
-    pub fn fingerprint(&self) -> &str {
-        &self.fingerprint
-    }
-
     /// Uploads a JPEG snapshot and returns the HTTP status (200 as of October 2026).
     pub fn upload_snapshot(&self, jpeg: &[u8]) -> Result<u16, ConnectError> {
         // "image/jpg" is what the upstream shell script sends and what has been verified to work.
@@ -99,7 +87,7 @@ impl Client {
         let mut body = serde_json::json!({ "config": { "name": name } });
         if live {
             body["type"] = "WEB".into();
-            body["features"] = serde_json::json!(crate::live::FEATURES);
+            body["features"] = serde_json::json!(super::live::FEATURES);
         }
         self.put("/c/info", "application/json", body.to_string().as_bytes())
     }
