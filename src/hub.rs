@@ -11,6 +11,7 @@
 //!   back to stills, so a viewer who reconnects doesn't wait for two restarts.
 //! - The newest keyframe is kept, for taking a still from the video later.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -45,7 +46,8 @@ pub struct Caps {
 pub struct Frame {
     /// Annex B, with start codes, and the parameter sets inline before each keyframe.
     pub data: Bytes,
-    /// When the camera produced it. Viewers time their stream by this, not by a frame rate.
+    /// When the camera produced it, by the stream's own clock (see [`Clock`]). Viewers time
+    /// their stream by this.
     pub captured: Instant,
     pub keyframe: bool,
 }
@@ -65,6 +67,8 @@ struct Inner {
     state: Mutex<State>,
     /// Signalled when a subscriber arrives or leaves.
     changed: Condvar,
+    /// Cleared if the hub's thread ends, which only a bug can make it do.
+    alive: AtomicBool,
 }
 
 #[derive(Default)]
@@ -72,6 +76,8 @@ struct State {
     subscribers: Vec<Subscriber>,
     next_id: u64,
     keyframe: Option<Frame>,
+    /// What the encoder runs, while it runs.
+    streaming: Option<LiveStream>,
 }
 
 struct Subscriber {
@@ -117,11 +123,22 @@ impl Hub {
             sensor,
             state: Mutex::default(),
             changed: Condvar::new(),
+            alive: AtomicBool::new(true),
         });
         let pump_inner = Arc::clone(&inner);
         thread::Builder::new()
             .name(format!("hub-{label}"))
-            .spawn(move || pump(&pump_inner))
+            .spawn(move || {
+                // Clears `alive` however the thread ends, panics included.
+                struct Alive<'a>(&'a AtomicBool);
+                impl Drop for Alive<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::SeqCst);
+                    }
+                }
+                let _alive = Alive(&pump_inner.alive);
+                pump(&pump_inner);
+            })
             .context("starting the video hub")?;
         Ok(Self { inner })
     }
@@ -145,6 +162,17 @@ impl Hub {
             frames,
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    /// What the encoder runs, while video runs, and how many subscribers watch it.
+    pub fn stream(&self) -> (Option<LiveStream>, usize) {
+        let state = self.inner.state.lock().unwrap();
+        (state.streaming, state.subscribers.len())
+    }
+
+    /// Whether the hub's thread is still running. If it isn't, nobody gets video any more.
+    pub fn is_alive(&self) -> bool {
+        self.inner.alive.load(Ordering::SeqCst)
     }
 
     /// The newest keyframe, while video runs. Unused until stills are taken from video.
@@ -225,9 +253,52 @@ fn choose(caps: &[Caps], (sensor_width, sensor_height): (u32, u32)) -> LiveStrea
     }
 }
 
+/// Gives frames evenly spaced times. The camera produces frames at a steady rate, but they're
+/// read from a pipe, and two can arrive in one read; stamped by arrival, they could share a time,
+/// which players reject. So each frame's time is the stream's start plus its count of frame
+/// intervals, set back to the arrival time whenever the two drift more than [`Clock::SLACK`]
+/// apart, as after dropped frames or a stall.
+struct Clock {
+    /// When the first frame counted from arrived; none before the stream's first frame.
+    start: Option<Instant>,
+    frames: u32,
+    interval: Duration,
+}
+
+impl Clock {
+    const SLACK: Duration = Duration::from_millis(500);
+
+    fn new(framerate: u32) -> Self {
+        Self {
+            start: None,
+            frames: 0,
+            interval: Duration::from_secs(1) / framerate.max(1),
+        }
+    }
+
+    fn stamp(&mut self, arrived: Instant) -> Instant {
+        if let Some(start) = self.start {
+            let expected = start + self.interval * self.frames;
+            let drift = if arrived > expected {
+                arrived - expected
+            } else {
+                expected - arrived
+            };
+            if drift <= Self::SLACK {
+                self.frames += 1;
+                return expected;
+            }
+        }
+        self.start = Some(arrived);
+        self.frames = 1;
+        arrived
+    }
+}
+
 /// Runs the encoder for the subscribers, and hands each frame to every one of them.
 fn pump(inner: &Inner) {
     let mut running: Option<(LiveStream, LiveFrames)> = None;
+    let mut clock = Clock::new(1);
     let mut idle_since: Option<Instant> = None;
     loop {
         let action = {
@@ -258,6 +329,7 @@ fn pump(inner: &Inner) {
             }
             if action == Action::Stop {
                 state.keyframe = None;
+                state.streaming = None;
             }
             action
         };
@@ -273,8 +345,11 @@ fn pump(inner: &Inner) {
                     stream.framerate,
                     stream.bitrate / 1000
                 );
-                // Replaces the stream that ran before, if any.
+                // Replaces the stream that ran before, if any. The new stream's first frame
+                // starts its clock.
                 running = Some((stream, inner.camera.start_live(stream)));
+                inner.state.lock().unwrap().streaming = Some(stream);
+                clock = Clock::new(stream.framerate);
             }
             Action::Stop => {
                 if let Some((_, frames)) = running.take() {
@@ -289,10 +364,13 @@ fn pump(inner: &Inner) {
             continue;
         };
         match live.frames.recv_timeout(TICK) {
-            Ok(frame) => hand_out(inner, frame.data, frame.captured),
+            Ok(frame) => hand_out(inner, frame.data, clock.stamp(frame.captured)),
             Err(RecvTimeoutError::Timeout) => {}
             // The camera dropped this stream; the next round starts another.
-            Err(RecvTimeoutError::Disconnected) => running = None,
+            Err(RecvTimeoutError::Disconnected) => {
+                running = None;
+                inner.state.lock().unwrap().streaming = None;
+            }
         }
     }
 }
@@ -346,6 +424,22 @@ mod tests {
     fn size(caps: Caps, sensor: (u32, u32)) -> (u32, u32) {
         let stream = choose(&[caps], sensor);
         (stream.width, stream.height)
+    }
+
+    #[test]
+    fn spaces_frames_evenly_and_follows_long_gaps() {
+        let mut clock = Clock::new(10);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // The first frame starts the clock. Frames read late, or two in one read, still get
+        // 100 ms apart.
+        assert_eq!(clock.stamp(at(0)), at(0));
+        assert_eq!(clock.stamp(at(180)), at(100));
+        assert_eq!(clock.stamp(at(181)), at(200));
+        assert_eq!(clock.stamp(at(300)), at(300));
+        // After a stall, time follows the camera again.
+        assert_eq!(clock.stamp(at(2000)), at(2000));
+        assert_eq!(clock.stamp(at(2110)), at(2100));
     }
 
     #[test]

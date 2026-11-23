@@ -7,6 +7,8 @@
 #   remote.sh remove-local --id ID
 #   remote.sh rtsp                            the directory also holds rtsp.toml
 #   remote.sh remove-rtsp
+#   remote.sh api                             the directory also holds api.toml
+#   remote.sh remove-api
 # Every mode also installs the program and unit from the directory. Exits 0 when every output
 # uploads (or is paused), 3 when the new version runs but an output needs attention, and 1 on
 # failure, after putting the previous version and settings back.
@@ -22,7 +24,7 @@ readonly DROP_INS=$ETC/conf.d
 readonly CREDENTIAL=$CREDENTIALS/cam0
 readonly FINGERPRINT=/var/lib/prusa-connect-camera/cam0.fingerprint
 readonly STATUS_FILE=/run/$SERVICE/status.json
-readonly RTSP_DROP_IN=$DROP_INS/rtsp.toml
+readonly RTSP_DROP_IN=$DROP_INS/rtsp.toml API_DROP_IN=$DROP_INS/api.toml
 # Where versions with an RTSP password kept it.
 readonly OLD_RTSP_CREDENTIAL=$CREDENTIALS/rtsp
 # The first upload takes about 10 s: rpicam-vid starts, then exposure settles.
@@ -94,10 +96,10 @@ case $mode in
     install -m 644 config.toml "$CONFIG"
     step "config installed"
     ;;
-  upgrade | add-local | remove-local | rtsp | remove-rtsp)
+  upgrade | add-local | remove-local | rtsp | remove-rtsp | api | remove-api)
     [[ -f $CONFIG ]] || fail "prusa-connect-camera isn't installed here yet; use install"
     ;;
-  *) fail "usage: remote.sh install|upgrade|add-local|remove-local|rtsp|remove-rtsp [--fingerprint VALUE] [--id ID]" ;;
+  *) fail "usage: remote.sh install|upgrade|add-local|remove-local|rtsp|remove-rtsp|api|remove-api [--fingerprint VALUE] [--id ID]" ;;
 esac
 case $mode in
   add-local)
@@ -121,6 +123,16 @@ case $mode in
     [[ -f $RTSP_DROP_IN ]] || fail "RTSP isn't turned on here"
     rm -f "$RTSP_DROP_IN" "$OLD_RTSP_CREDENTIAL"
     step "RTSP turned off"
+    ;;
+  api)
+    install -d -m 755 "$DROP_INS"
+    install -m 644 api.toml "$API_DROP_IN"
+    step "API turned on: $(grep '^listen' "$API_DROP_IN")"
+    ;;
+  remove-api)
+    [[ -f $API_DROP_IN ]] || fail "the API isn't turned on here"
+    rm -f "$API_DROP_IN"
+    step "API turned off"
     ;;
 esac
 
@@ -183,16 +195,16 @@ show_status() {
 
 status=0
 wait_healthy || status=$?
-# The address the LAN reaches this Pi at: the one its route to the internet uses, which is
-# never Tailscale's.
-rtsp_url() {
-  local ip
+# Where the LAN reaches the listener a drop-in configures, as SCHEME://ADDRESS:PORT: the
+# address is the one this Pi's route to the internet uses, which is never Tailscale's.
+lan_address() {
+  local scheme=$1 file=$2 ip
   ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
-  grep -q '^listen = "127\.' "$RTSP_DROP_IN" && ip=127.0.0.1
+  grep -q '^listen = "127\.' "$file" && ip=127.0.0.1
   if [[ $ip =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]; then
-    step "WARNING: this Pi reaches the internet over Tailscale ($ip); give the server the Pi's LAN address instead"
+    step "WARNING: this Pi reaches the internet over Tailscale ($ip); use the Pi's LAN address instead"
   fi
-  printf 'rtsp://%s:%s/cam0' "${ip:-<this Pi>}" "$(sed -n 's/^listen = ".*:\([0-9]*\)"/\1/p' "$RTSP_DROP_IN")"
+  printf '%s://%s:%s' "$scheme" "${ip:-<this Pi>}" "$(sed -n 's/^listen = ".*:\([0-9]*\)"/\1/p' "$file")"
 }
 
 case $status in
@@ -201,7 +213,10 @@ case $status in
     show_status
     if [[ $mode == rtsp ]]; then
       step "give the prusa-connect server's camera this stream address:"
-      printf '      %s\n' "$(rtsp_url)"
+      printf '      %s/cam0\n' "$(lan_address rtsp "$RTSP_DROP_IN")"
+    elif [[ $mode == api ]]; then
+      step "the API is at:"
+      printf '      %s/v1\n' "$(lan_address http "$API_DROP_IN")"
     fi
     exit 0
     ;;

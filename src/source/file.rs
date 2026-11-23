@@ -1,11 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, ensure};
 
-use super::FrameSource;
+use super::{FrameSource, Still};
 
 pub struct FileSource {
     path: PathBuf,
@@ -29,5 +29,24 @@ impl FrameSource for FileSource {
             self.path.display()
         );
         Ok(jpeg.into())
+    }
+
+    fn latest(&self) -> Option<Still> {
+        let jpeg = self.capture(Duration::ZERO).ok()?;
+        let wall = fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .unwrap_or_else(|_| SystemTime::now());
+        Some(Still {
+            jpeg,
+            seq: 1,
+            captured: Instant::now(),
+            wall,
+        })
+    }
+
+    /// The file is the only still there is, so it's always the newest.
+    fn newer(&self, _seq: u64, _timeout: Duration) -> Result<Still> {
+        self.latest()
+            .with_context(|| format!("reading {}", self.path.display()))
     }
 }

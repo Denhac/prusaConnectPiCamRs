@@ -27,6 +27,7 @@ const MAX_VIEWERS: usize = 2;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 
 /// A camera offered for live view.
+#[derive(Clone)]
 pub struct Camera {
     pub id: String,
     pub name: String,

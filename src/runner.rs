@@ -1,5 +1,7 @@
-//! Starts each camera's outputs, one upload loop apiece, and reports liveness to systemd.
+//! Starts each camera's outputs, watches that they keep running, reports liveness to systemd, and
+//! stops everything in order: on a stop signal, or when a part has failed for good.
 
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,10 +12,11 @@ use sd_notify::NotifyState;
 use crate::config::{CameraConfig, Config, SourceConfig};
 use crate::hub::Hub;
 use crate::outputs::connect_cloud::{self, live};
-use crate::outputs::rtsp;
+use crate::outputs::{api, rtsp};
 use crate::source::rpicam::Rpicam;
 use crate::source::{self, CAPTURE_TIMEOUT, FrameSource};
 use crate::status::Status;
+use crate::supervise::{self, Service};
 use crate::uploader::{MAX_BACKOFF, REQUEST_TIMEOUT, StillTarget, Uploader};
 
 /// An upload loop that hasn't come round in this long is stuck: the longest backoff plus a
@@ -27,6 +30,8 @@ struct OpenSource {
     frames: Arc<dyn FrameSource>,
     /// Live video, from a camera that has it.
     hub: Option<Hub>,
+    /// The rpicam-vid process, which has to be stopped before the program ends.
+    rpicam: Option<Rpicam>,
 }
 
 fn open_source(camera: &CameraConfig) -> Result<OpenSource> {
@@ -35,13 +40,15 @@ fn open_source(camera: &CameraConfig) -> Result<OpenSource> {
             let rpicam = Rpicam::start(config)?;
             let hub = Hub::start(&camera.id, rpicam.clone(), config.live_sensor_size())?;
             OpenSource {
-                frames: Arc::new(rpicam),
+                frames: Arc::new(rpicam.clone()),
                 hub: Some(hub),
+                rpicam: Some(rpicam),
             }
         }
         other => OpenSource {
             frames: source::open(other)?,
             hub: None,
+            rpicam: None,
         },
     })
 }
@@ -92,16 +99,39 @@ fn spawn(uploader: Uploader) -> Result<Worker> {
     })
 }
 
+/// How long rpicam-vid may take to exit when the program stops.
+const CAMERA_SHUTDOWN: Duration = Duration::from_secs(3);
+
+/// Everything running, which [`check`] watches and [`shutdown`] stops.
+struct Running {
+    workers: Vec<Worker>,
+    hubs: Vec<(String, Hub)>,
+    live: Option<live::Live>,
+    rtsp: Option<Service>,
+    api: Option<Service>,
+    cameras: Vec<Rpicam>,
+}
+
 pub fn run(config: &Config) -> Result<()> {
+    let stop = supervise::stop_signals()?;
     let status = Status::from_env();
     let mut uploaders = Vec::new();
     let mut live_cameras = Vec::new();
     let mut hubs = Vec::new();
+    let mut cameras = Vec::new();
+    let mut api_cameras = Vec::new();
     for camera in &config.cameras {
         let source = open_source(camera)?;
         if let Some(hub) = &source.hub {
             hubs.push((camera.id.clone(), hub.clone()));
         }
+        api_cameras.push(api::Camera {
+            id: camera.id.clone(),
+            name: camera.name.clone(),
+            stills: Arc::clone(&source.frames),
+            hub: source.hub.clone(),
+        });
+        cameras.extend(source.rpicam.clone());
         let outputs = outputs(config, camera, &source)?;
         for target in outputs.stills {
             let frames = Arc::clone(&source.frames);
@@ -110,49 +140,105 @@ pub fn run(config: &Config) -> Result<()> {
         live_cameras.extend(outputs.live);
     }
 
-    let live_thread = if live_cameras.is_empty() {
+    let live = if live_cameras.is_empty() {
         None
     } else {
         Some(live::spawn(config.signaling_url.clone(), live_cameras)?)
     };
-    let rtsp_thread = match &config.rtsp {
-        Some(rtsp_config) => Some(rtsp::spawn(rtsp_config, hubs, status.clone())?),
+    let rtsp = match &config.rtsp {
+        Some(rtsp_config) => Some(rtsp::spawn(rtsp_config, hubs.clone(), status.clone())?),
+        None => None,
+    };
+    let api = match &config.api {
+        Some(api_config) => {
+            let rtsp_port = config
+                .rtsp
+                .as_ref()
+                .and_then(|r| r.listen.parse::<std::net::SocketAddr>().ok())
+                .map(|a| a.port());
+            Some(api::spawn(
+                api_config,
+                api_cameras,
+                rtsp_port,
+                status.clone(),
+            )?)
+        }
         None => None,
     };
     let workers = uploaders
         .into_iter()
         .map(spawn)
         .collect::<Result<Vec<_>>>()?;
+    let running = Running {
+        workers,
+        hubs,
+        live,
+        rtsp,
+        api,
+        cameras,
+    };
 
     let _ = sd_notify::notify(&[NotifyState::Ready]);
     let watchdog = sd_notify::watchdog_enabled();
     let tick = watchdog.map_or(Duration::from_secs(10), |timeout| timeout / 2);
     loop {
-        thread::sleep(tick);
-        // Exiting lets systemd restart everything, including rpicam-vid.
-        for worker in &workers {
-            if worker.handle.is_finished() {
-                bail!("{}'s upload loop crashed", worker.label);
+        match stop.recv_timeout(tick) {
+            Ok(()) => {
+                log::info!("stopping");
+                shutdown(&running);
+                return Ok(());
             }
-            if worker.heartbeat.lock().unwrap().elapsed() > STALL_LIMIT {
-                bail!("{}'s upload loop is stuck", worker.label);
-            }
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
         }
-        if live_thread
-            .as_ref()
-            .is_some_and(|thread| thread.is_finished())
-        {
-            bail!("live view crashed");
-        }
-        if rtsp_thread
-            .as_ref()
-            .is_some_and(|thread| thread.is_finished())
-        {
-            bail!("the RTSP server crashed");
+        // A part that failed for good ends the program, and systemd starts it again.
+        if let Err(e) = check(&running) {
+            log::error!("{e:#}; stopping, to be restarted");
+            shutdown(&running);
+            return Err(e);
         }
         if watchdog.is_some() {
             let _ = sd_notify::notify(&[NotifyState::Watchdog]);
         }
+    }
+}
+
+/// Fails if any part has stopped or stopped making progress. Upload loops and async tasks that
+/// panic restart on their own, so what's left here means something is wrong beyond that.
+fn check(running: &Running) -> Result<()> {
+    for worker in &running.workers {
+        if worker.handle.is_finished() {
+            bail!("{}'s upload loop ended", worker.label);
+        }
+        if worker.heartbeat.lock().unwrap().elapsed() > STALL_LIMIT {
+            bail!("{}'s upload loop is stuck", worker.label);
+        }
+    }
+    for (id, hub) in &running.hubs {
+        if !hub.is_alive() {
+            bail!("camera {id}'s video hub stopped");
+        }
+    }
+    if let Some(live) = &running.live {
+        live.check()?;
+    }
+    if let Some(rtsp) = &running.rtsp {
+        rtsp.check()?;
+    }
+    if let Some(api) = &running.api {
+        api.check()?;
+    }
+    Ok(())
+}
+
+/// Closes live view sessions, so their relay allocations are released, then stops rpicam-vid,
+/// so it lets go of the camera rather than being killed with the program.
+fn shutdown(running: &Running) {
+    let _ = sd_notify::notify(&[NotifyState::Stopping]);
+    if let Some(live) = &running.live {
+        live.stop();
+    }
+    for camera in &running.cameras {
+        camera.shutdown(CAMERA_SHUTDOWN);
     }
 }
 

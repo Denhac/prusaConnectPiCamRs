@@ -18,6 +18,8 @@ Usage:
   deploy/deploy.sh remove-local HOST [--id ID]
   deploy/deploy.sh rtsp HOST [--listen ADDRESS:PORT]
   deploy/deploy.sh remove-rtsp HOST
+  deploy/deploy.sh api HOST [--listen ADDRESS:PORT]
+  deploy/deploy.sh remove-api HOST
 
 install  Sets up a Pi with its Prusa Connect camera token and a fresh config naming the
          camera NAME (default: HOST), with sizes that fit its camera. Use it for a new Pi,
@@ -41,6 +43,10 @@ rtsp     Serves the Pi's live video over RTSP at rtsp://<Pi>:8554/cam0 to anyone
          prusa-connect server's camera as its stream address.
 remove-rtsp
          Stops serving RTSP.
+api      Serves the read-only HTTP API (docs/api.md) at http://<Pi>:8555/v1 to anyone
+         on a private network, with no password, and prints its address.
+remove-api
+         Stops serving the API.
 
 Every command builds the program first, checks each Pi has a working camera before
 copying anything, installs the program, and waits for every output to upload. If the new
@@ -76,7 +82,7 @@ url=""
 server_camera=""
 output_id=local
 insecure_http=false
-listen=0.0.0.0:8554
+listen=""
 build=true
 check_camera=true
 while (( $# )); do
@@ -101,10 +107,13 @@ while (( $# )); do
 done
 
 case $mode in
-  install | add-local | remove-local | rtsp | remove-rtsp)
+  install | add-local | remove-local | rtsp | remove-rtsp | api | remove-api)
     (( ${#hosts[@]} == 1 )) || die "$mode takes exactly one host, since each camera has its own token"
     ;;&
-  rtsp)
+  rtsp | api)
+    if [[ -z $listen ]]; then
+      if [[ $mode == rtsp ]]; then listen=0.0.0.0:8554; else listen=0.0.0.0:8555; fi
+    fi
     # Checked here so the TOML written below needs no escaping; the program checks again.
     [[ $listen =~ ^[0-9.]+:[0-9]+$ ]] || die "--listen must be an IPv4 address and port, e.g. 0.0.0.0:8554"
     ;;
@@ -126,7 +135,7 @@ case $mode in
   add-local | remove-local)
     [[ $output_id =~ ^[A-Za-z0-9_-]+$ ]] || die "--id may only contain letters, digits, '-' and '_'"
     ;;
-  install | remove-rtsp) ;;
+  install | remove-rtsp | remove-api) ;;
   upgrade)
     (( ${#hosts[@]} > 0 )) || die "upgrade needs at least one host"
     if [[ -n $token_file$name$fingerprint$url$server_camera ]] || $live; then
@@ -230,9 +239,9 @@ make_bundle() {
     printf '%s\n' "$token" >"$dir/token"
     write_output >"$dir/output.toml"
     files+=(token output.toml)
-  elif [[ $mode == rtsp ]]; then
-    write_rtsp >"$dir/rtsp.toml"
-    files+=(rtsp.toml)
+  elif [[ $mode == rtsp || $mode == api ]]; then
+    write_listener "$mode" >"$dir/$mode.toml"
+    files+=("$mode.toml")
   fi
   (cd "$dir" && sha256sum -- "${files[@]}" >SHA256SUMS)
 }
@@ -281,11 +290,11 @@ write_output() {
   fi
 }
 
-# The drop-in for rtsp. Its value was checked above and needs no escaping.
-write_rtsp() {
+# The drop-in for rtsp or api. Its value was checked above and needs no escaping.
+write_listener() {
   printf '%s\n' \
-    "# Written by deploy/deploy.sh rtsp; deploy/deploy.sh remove-rtsp removes it." \
-    '[rtsp]' \
+    "# Written by deploy/deploy.sh $1; deploy/deploy.sh remove-$1 removes it." \
+    "[$1]" \
     "listen = \"$listen\""
 }
 

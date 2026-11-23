@@ -238,6 +238,12 @@ mod tests {
         fn capture(&self, _timeout: Duration) -> anyhow::Result<Arc<[u8]>> {
             Ok(Arc::clone(&self.0))
         }
+        fn latest(&self) -> Option<crate::source::Still> {
+            None
+        }
+        fn newer(&self, _seq: u64, _timeout: Duration) -> anyhow::Result<crate::source::Still> {
+            anyhow::bail!("not used")
+        }
     }
 
     /// Answers each send with the next result from a script, and counts the hooks called.

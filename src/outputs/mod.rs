@@ -5,6 +5,7 @@
 //! Prusa Connect (`connect_cloud`) is configured in the camera's own section, for compatibility
 //! with configs from before outputs; every other kind is an `[[output]]`.
 
+pub mod api;
 pub mod connect_cloud;
 pub mod connect_local;
 pub mod rtsp;

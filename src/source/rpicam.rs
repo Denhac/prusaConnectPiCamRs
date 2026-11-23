@@ -9,14 +9,14 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 
 use super::h264::AccessUnits;
 use super::jpeg::Splitter;
-use super::{FrameSource, Paused};
+use super::{FrameSource, Paused, Still};
 use crate::config::RpicamConfig;
 
 /// Frames skipped after rpicam-vid starts, while auto exposure and white balance settle.
@@ -55,7 +55,7 @@ struct State {
     seq: u64,
     /// Snapshot frames received from the current rpicam-vid process.
     since_start: u64,
-    latest: Option<Arc<[u8]>>,
+    latest: Option<Still>,
     /// Why rpicam-vid last stopped, reported when no frames arrive.
     last_error: Option<String>,
     /// Set while someone watches live view.
@@ -68,6 +68,8 @@ struct State {
     last_frame: Option<Instant>,
     /// How long the running process may go without producing a frame.
     stall_limit: Duration,
+    /// Set by [`Rpicam::shutdown`]: no new process is started.
+    stopping: bool,
 }
 
 struct Live {
@@ -118,6 +120,23 @@ impl Rpicam {
         LiveFrames { id, frames }
     }
 
+    /// Stops rpicam-vid for good and waits up to `timeout` for it to exit, so it releases the
+    /// camera before the program ends rather than being killed with it.
+    pub fn shutdown(&self, timeout: Duration) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.stopping = true;
+        if let Some(pid) = state.pid {
+            // SAFETY: kill only sends a signal. `pid` is our child, cleared under the state lock
+            // before the child is reaped, so it can't refer to a reused process id.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        }
+        let _ = self
+            .shared
+            .new_frame
+            .wait_timeout_while(state, timeout, |s| s.pid.is_some())
+            .unwrap();
+    }
+
     /// Ends live stream `id` and resumes snapshots, unless another stream replaced it already.
     pub fn stop_live(&self, id: u64) {
         let mut state = self.shared.state.lock().unwrap();
@@ -164,7 +183,31 @@ impl FrameSource for Rpicam {
                 None => bail!("no frame from rpicam-vid within {timeout:?}"),
             }
         }
-        Ok(Arc::clone(state.latest.as_ref().expect("a frame arrived")))
+        Ok(Arc::clone(
+            &state.latest.as_ref().expect("a frame arrived").jpeg,
+        ))
+    }
+
+    fn latest(&self) -> Option<Still> {
+        self.shared.state.lock().unwrap().latest.clone()
+    }
+
+    fn newer(&self, seq: u64, timeout: Duration) -> Result<Still> {
+        let state = self.shared.state.lock().unwrap();
+        let (state, wait) = self
+            .shared
+            .new_frame
+            .wait_timeout_while(state, timeout, |s| {
+                s.live.is_none() && (s.seq <= seq || s.since_start <= SETTLE_FRAMES)
+            })
+            .unwrap();
+        if state.live.is_some() {
+            return Err(Paused.into());
+        }
+        if wait.timed_out() {
+            bail!("no newer still within {timeout:?}");
+        }
+        Ok(state.latest.clone().expect("a frame arrived"))
     }
 }
 
@@ -275,6 +318,9 @@ fn supervise(config: &RpicamConfig, shared: &Shared) {
     loop {
         let (generation, args, frames, limit) = {
             let state = shared.state.lock().unwrap();
+            if state.stopping {
+                return;
+            }
             match &state.live {
                 Some(live) => (
                     state.generation,
@@ -292,11 +338,14 @@ fn supervise(config: &RpicamConfig, shared: &Shared) {
         };
         let started = Instant::now();
         let result = stream(&config.command, &args, shared, generation, frames, limit);
-        let switched = {
+        let (switched, stopping) = {
             let mut state = shared.state.lock().unwrap();
             state.since_start = 0;
-            state.generation != generation
+            (state.generation != generation, state.stopping)
         };
+        if stopping {
+            return;
+        }
         if switched {
             delay = Duration::from_secs(1);
             continue;
@@ -357,6 +406,8 @@ fn stream(
         None => read_snapshots(stdout, shared),
     };
     shared.state.lock().unwrap().pid = None;
+    // Wakes a shutdown waiting for the process to exit.
+    shared.new_frame.notify_all();
     // Usually a no-op: the stream ends because rpicam-vid exited.
     let _ = child.kill();
     let status = child
@@ -377,7 +428,12 @@ fn read_snapshots(mut stdout: impl Read, shared: &Shared) -> Result<()> {
             let mut state = shared.state.lock().unwrap();
             state.seq += 1;
             state.since_start += 1;
-            state.latest = Some(frame.into());
+            state.latest = Some(Still {
+                jpeg: frame.into(),
+                seq: state.seq,
+                captured: Instant::now(),
+                wall: SystemTime::now(),
+            });
             state.last_frame = Some(Instant::now());
             state.last_error = None;
             shared.new_frame.notify_all();

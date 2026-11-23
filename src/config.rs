@@ -35,6 +35,9 @@ pub struct Config {
     /// Live video over RTSP, for the cameras with video. In this file or one drop-in.
     #[serde(default)]
     pub rtsp: Option<crate::outputs::rtsp::Config>,
+    /// The read-only HTTP API. In this file or one drop-in.
+    #[serde(default)]
+    pub api: Option<crate::outputs::api::Config>,
 }
 
 /// A drop-in file in `conf.d/`. It only adds outputs, so a deploy can add or remove one by
@@ -46,6 +49,8 @@ struct DropIn {
     outputs: Vec<OutputConfig>,
     #[serde(default)]
     rtsp: Option<crate::outputs::rtsp::Config>,
+    #[serde(default)]
+    api: Option<crate::outputs::api::Config>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,6 +271,9 @@ impl Config {
                 "rtsp: no camera has video; it needs the rpicam source"
             );
         }
+        if let Some(api) = &self.api {
+            api.validate()?;
+        }
         let mut outputs = HashSet::new();
         for output in &self.outputs {
             let camera = self.camera_of(output)?;
@@ -369,6 +377,14 @@ fn load_drop_ins(dir: &Path, config: &mut Config) -> Result<()> {
                 path.display()
             );
             config.rtsp = drop_in.rtsp;
+        }
+        if drop_in.api.is_some() {
+            ensure!(
+                config.api.is_none(),
+                "{}: [api] is set in more than one file",
+                path.display()
+            );
+            config.api = drop_in.api;
         }
     }
     Ok(())

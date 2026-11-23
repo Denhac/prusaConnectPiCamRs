@@ -148,6 +148,18 @@ The same camera can also send its snapshots to a self-hosted
 Connect or instead of it. Tested with prusa-connect 0.1.0-beta.1, which is a beta whose API may
 still change; [docs/design/compat.md](docs/design/compat.md) lists what this relies on.
 
+`deploy/provision-local.sh` does all of it in one command, logged in as an administrator:
+
+```shell
+deploy/provision-local.sh camera-pi-1 --server https://connect.example.org --rtsp --printer <device id>
+```
+
+It adds the camera to the server, makes the bot's service account an operator of it, mints a
+token, runs `add-local` (and with `--rtsp`, `rtsp`, setting the camera's live view to the Pi's
+stream), then revokes the bot's older tokens. Running it again replaces the token. Use
+`--push-url` when the Pi reaches the server at another address than your computer does, and
+`--help` for the rest. By hand, the steps are as follows.
+
 On the server, as an administrator:
 
 1. Add the camera as a **generic** camera with no snapshot address, on its printer's Cameras tab
@@ -203,6 +215,19 @@ watches. VLC, mpv or ffmpeg can play the same address.
   isn't encrypted.
 - RTP goes over the RTSP connection (TCP), so no UDP ports need opening.
 - `remove-rtsp` turns it off.
+
+### The Pi's camera API
+
+Other programs, such as a Slack bot, can fetch the cameras' pictures from the Pi itself:
+
+```shell
+deploy/deploy.sh api camera-pi-1
+curl -s -o green.jpg http://10.0.0.174:8555/v1/cameras/cam0/still
+```
+
+It's read-only: the camera list, the latest still (with `max_age` and `wait`), and the outputs'
+status. Like RTSP it has no password, and only private networks may connect.
+[docs/api.md](docs/api.md) is the full contract.
 
 `prusa-connect-camera status` shows what each output of the running service is doing:
 

@@ -15,7 +15,6 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -31,6 +30,7 @@ use tokio::time::timeout;
 use crate::hub::{Caps, Hub, Subscription};
 use crate::net::is_private;
 use crate::status::{State, Status};
+use crate::supervise::{self, Service};
 use rtp::Packetizer;
 
 /// Keys the server's status, and prefixes its log lines.
@@ -106,12 +106,9 @@ impl Config {
     }
 }
 
-/// Starts the server on a thread of its own, for the cameras with video.
-pub fn spawn(
-    config: &Config,
-    cameras: Vec<(String, Hub)>,
-    status: Status,
-) -> Result<thread::JoinHandle<()>> {
+/// Starts the server on a runtime of its own, for the cameras with video. It restarts itself if
+/// it panics.
+pub fn spawn(config: &Config, cameras: Vec<(String, Hub)>, status: Status) -> Result<Service> {
     let server = Arc::new(Server {
         listen: config.listen.parse()?,
         cameras: cameras.into_iter().collect(),
@@ -126,18 +123,11 @@ pub fn spawn(
         status,
     });
     server.status.register(LABEL);
-    thread::Builder::new()
-        .name("rtsp".into())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("rtsp-runtime")
-                .enable_all()
-                .build()
-                .expect("building the RTSP runtime");
-            runtime.block_on(server.run());
-        })
-        .context("starting the RTSP server")
+    supervise::spawn_runtime(
+        "rtsp",
+        2,
+        supervise::restart_on_panic(LABEL.into(), move || Arc::clone(&server).run()),
+    )
 }
 
 struct Server {

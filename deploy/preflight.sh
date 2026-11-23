@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run on the Pi as the SSH user by deploy.sh, before anything is copied. Changes nothing.
-#   preflight.sh install|upgrade|add-local|remove-local|rtsp|remove-rtsp CHECK_CAMERA
+#   preflight.sh install|upgrade|add-local|remove-local|rtsp|remove-rtsp|api|remove-api CHECK_CAMERA
 set -uo pipefail
 
 mode=$1

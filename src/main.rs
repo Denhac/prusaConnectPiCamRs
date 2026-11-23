@@ -6,6 +6,7 @@ mod runner;
 mod secret;
 mod source;
 mod status;
+mod supervise;
 mod uploader;
 
 use std::fs;

@@ -47,7 +47,7 @@ pub struct OutputStatus {
     pub since: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Report {
     pub pid: u32,
     /// By label, e.g. `cam0/cloud`.
@@ -98,6 +98,11 @@ impl Status {
             },
             write_failed: false,
         })))
+    }
+
+    /// Every output's state now.
+    pub fn report(&self) -> Report {
+        self.0.lock().unwrap().report.clone()
     }
 
     pub fn register(&self, label: &str) {

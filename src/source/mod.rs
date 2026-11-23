@@ -8,7 +8,7 @@ pub mod rpicam;
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 
@@ -17,11 +17,26 @@ use crate::config::SourceConfig;
 /// Long enough for rpicam-vid to start and let exposure settle at a low frame rate.
 pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Shared by every output of a camera, each calling `capture` on its own schedule.
+/// A still image, numbered in the order the camera made them.
+#[derive(Clone)]
+pub struct Still {
+    pub jpeg: Arc<[u8]>,
+    pub seq: u64,
+    pub captured: Instant,
+    /// The same moment by the wall clock, for clients that cache by date.
+    pub wall: SystemTime,
+}
+
+/// Shared by every output of a camera, each calling it on its own schedule.
 pub trait FrameSource: Send + Sync {
     /// Returns a JPEG captured after this call started, waiting at most `timeout`. Fails with
     /// [`Paused`] while someone watches live view.
     fn capture(&self, timeout: Duration) -> Result<Arc<[u8]>>;
+    /// The newest still, without waiting; none before the first.
+    fn latest(&self) -> Option<Still>;
+    /// Waits at most `timeout` for a still newer than the one numbered `seq`. Fails with
+    /// [`Paused`] while someone watches live view.
+    fn newer(&self, seq: u64, timeout: Duration) -> Result<Still>;
 }
 
 /// Snapshots are paused because the camera is streaming live view.

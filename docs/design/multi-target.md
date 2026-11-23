@@ -133,6 +133,30 @@ The phase 3 live test on xl (2026-11-22) worked:
   That needs a printer on the local server first: its UI shows cameras on printer pages and
   dashboard cards. Until then, mpv or VLC on the RTSP address is the same multi-viewer path.
 
+**After the first commit (5083987), on 2026-11-22:**
+- **Robustness:**
+  - `src/supervise.rs` puts each async part on its own runtime and thread, with a heartbeat the
+    watchdog checks. Tasks that panic restart with backoff.
+  - The watchdog also checks the hubs.
+  - One shutdown path for SIGTERM and fatal errors: close cloud sessions (so relay allocations
+    are released), then stop rpicam-vid and wait for it. No more SIGKILL at stop.
+  - The hub gives frames evenly spaced times from the encoder's rate, set back to arrival time
+    after half a second of drift. Arrival times alone gave equal RTP timestamps when two frames
+    came in one read, which ffmpeg flagged.
+- **Phase 5, the Pi API** (`src/outputs/api/`, contract in docs/api.md):
+  - plain HTTP on :8555, no password, private networks only, like RTSP
+  - `/v1/cameras`, `/v1/cameras/{id}`, `/v1/cameras/{id}/still?max_age&wait` (ETag = still
+    number, 304, 503 with `Retry-After` while stills pause), `/v1/status`
+  - `deploy.sh api` and `remove-api`
+  - tested locally with the fake camera, and on xl
+- **Provisioning:** `deploy/provision-local.sh` takes a Pi onto a server, logged in as an
+  administrator:
+  - camera, service-account grant, token
+  - `add-local`, optionally `rtsp` plus the camera's `stream_url`
+  - revokes older tokens of the same name once the new one uploads
+
+  Tested twice on xl's server; the second run revoked the first run's token.
+
 **Already there before this work:** when the service stops, the program exits without
 waiting for `rpicam-vid`, and systemd SIGKILLs it (seen on 2026-11-08 as well).
 
