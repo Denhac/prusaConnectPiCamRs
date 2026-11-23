@@ -160,6 +160,79 @@ The phase 3 live test on xl (2026-11-22) worked:
 **Already there before this work:** when the service stops, the program exits without
 waiting for `rpicam-vid`, and systemd SIGKILLs it (seen on 2026-11-08 as well).
 
+## State on 2026-11-22, and the printer test
+
+**Fleet:**
+- All five Pis run build `1fa8d6ebe071` (commit 8946aeb).
+- blue, green, black and orange are cloud-only.
+- `connect-pi` (formerly camera-pi-5, the XL's camera) also:
+  - pushes stills to the server running on itself (output `xl-test`, `http://127.0.0.1:8080`,
+    server camera `camera-pi-5`, token of `service_account:camera-pi-5` until 2027-11-22)
+  - serves RTSP on :8554 and the Pi API on :8555
+
+**Server:**
+- prusa-connect 0.1.0-beta.1 runs on `connect-pi` as the systemd service `prusa-connect`, as
+  the upstream "Install from a release" guide lays it out:
+  - user `prusa-connect`
+  - binary `/var/lib/prusa-connect/bin/prusa-connect`
+  - `/etc/prusa-connect/config.yaml` from the release
+  - data in `/var/lib/prusa-connect/config/config.d`
+  - the wizard's `setup.yaml` in `/etc/prusa-connect/config.d`
+- Clients reach it at `http://connect.example.org:8080`, which resolves on the LAN
+  only.
+- `printer_address` is `http://connect-pi:8080`:
+  - printers keep at most 20 bytes of the hostname, and the server refuses a longer one at
+    startup
+  - the LAN DNS (10.0.0.1) answers bare names
+- It has camera `camera-pi-5` (generic, `stream_url = rtsp://10.0.0.36:8554/cam0`, no printer
+  yet), and no printers.
+- The old hand-run copy is in `/home/rpi/connect-pi`, as a backup.
+
+**When a printer is on the server, test:**
+1. **Move the printer.**
+   - On the server's "Add a printer" page, download the settings file and check it says
+     `hostname = connect-pi`, `port = 8080`, `tls = false`.
+   - Load it from USB (Settings, Network, Prusa Connect, Load Settings), add the printer, and
+     approve the code on the page.
+   - A printer talks to one Connect server at a time, so it goes offline in Prusa Connect.
+2. **Put the camera on the printer:**
+
+   ```shell
+   deploy/provision-local.sh connect-pi --camera camera-pi-5 --id xl-test \
+     --server http://connect-pi:8080 --push-url http://127.0.0.1:8080 --insecure-http \
+     --rtsp --printer <device id>
+   ```
+
+   - `--camera camera-pi-5` is needed because the host is no longer called that.
+   - The device id is in `GET /api/v1/devices`.
+   - The printer's grants are copied onto the camera the first time it is put on it.
+3. **Watch in the server's UI.** On the printer's Cameras tab:
+   - the still is there
+   - live view plays: the server reads the Pi's RTSP and relays it over WebRTC
+   - it works from a LAN-only client (a phone on the space's Wi-Fi with Tailscale off), since
+     the relay also offers loopback and Tailscale candidates
+4. **Several viewers at once:**
+   - the server's UI, Prusa Connect's (if the camera is still viewable there with its printer
+     gone), and `mpv rtsp://connect-pi:8554/cam0`
+   - expect the stream to drop to the lowest quality any viewer asked for
+5. **Long live view:** during a session of more than 5 minutes, the server's thumbnail goes
+   blank (`stale`); check it comes back afterwards.
+6. **Decide per printer** whether to keep its Prusa Connect output once it has moved. It's
+   `cloud = false` in `config.toml`; ask before editing it.
+7. **Other bots:** `provision-local.sh <pi> --server … --push-url
+   http://connect.example.org:8080 --insecure-http --rtsp --printer …`, and
+   `https` once certbot is on.
+
+**Not done yet:**
+- **certbot TLS for browsers.** The API listener then speaks only TLS 1.3, which printers can't,
+  so printers need a separate connector listener (`core.connectors.<name>.config.listener`):
+  plain HTTP on another port, or a private-CA ECDSA certificate naming `connect-pi`, with a
+  chain of at most 1024 bytes. Then `printer_address` takes that port, and printers load the
+  settings file again.
+- **DHCP reservation** for 10.0.0.36, since the camera's `stream_url` uses the IP.
+- **Stills from live video** (plan in "The hub").
+- **The Slack module** (separate project), against docs/api.md.
+
 ## Requirements
 
 1. **Cloud and local at once.** A Pi publishes to Prusa Connect (connect.prusa3d.com, the
