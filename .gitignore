@@ -20,3 +20,6 @@
 *.swp
 *~
 .DS_Store
+
+# Site details: real host names, addresses and device IDs (see local/site.md). Never commit them.
+/local/

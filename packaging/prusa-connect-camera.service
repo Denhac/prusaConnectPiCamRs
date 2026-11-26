@@ -1,14 +1,17 @@
 [Unit]
-Description=Upload Raspberry Pi camera snapshots to Prusa Connect
+Description=Send Raspberry Pi camera pictures to Prusa Connect
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=notify
 ExecStart=/usr/local/bin/prusa-connect-camera run --config /etc/prusa-connect-camera/config.toml
-# One line per [[camera]] in the config, named after its id. Each file holds only that
-# camera's token and is readable by this service alone.
-LoadCredential=cam0:/etc/prusa-connect-camera/credentials/cam0
+# Every file in credentials/ reaches the service as the credential pcc_<file name>: cam0 holds
+# camera cam0's Prusa Connect token, and cam0-<output id> the token of each of its other outputs.
+# Only this service can read them.
+LoadCredential=pcc:/etc/prusa-connect-camera/credentials
+# Holds status.json, which `prusa-connect-camera status` reads.
+RuntimeDirectory=prusa-connect-camera
 Restart=always
 RestartSec=10
 WatchdogSec=60

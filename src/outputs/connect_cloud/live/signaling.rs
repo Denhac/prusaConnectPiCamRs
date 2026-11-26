@@ -14,18 +14,20 @@ use super::proto::{self, ClientType, MessageType, StreamStatus, Toggle, WebrtcMo
 use super::session::{self, Command, Outgoing, Session};
 use super::socketio::{self, Packet, Writer};
 use crate::config::Token;
-use crate::source::rpicam::Rpicam;
+use crate::hub::Hub;
 
 /// The origin Prusa's browser webcam connects from.
 const ORIGIN: &str = "https://camera-service-webcam.prusa3d.com";
 const USER_AGENT: &str = concat!("prusa-connect-camera/", env!("CARGO_PKG_VERSION"));
 /// Prusa's webcam authenticates again this often on a long-lived connection.
 const REAUTH_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
-/// Prusa's webcam serves one viewer at a time.
-const MAX_VIEWERS: usize = 1;
+/// Viewers watching at once. Prusa's webcam serves one; the hub shares one stream among them,
+/// and each viewer's relay allocation counts against that viewer's own quota.
+const MAX_VIEWERS: usize = 2;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 
 /// A camera offered for live view.
+#[derive(Clone)]
 pub struct Camera {
     pub id: String,
     pub name: String,
@@ -34,9 +36,8 @@ pub struct Camera {
     pub hardware: String,
     /// The snapshot resolution, reported as the camera's current one.
     pub resolution: (u32, u32),
-    /// The size of the sensor mode live view reads.
-    pub sensor_size: (u32, u32),
-    pub source: Rpicam,
+    /// The camera's video, shared with its other viewers.
+    pub hub: Hub,
 }
 
 /// Keeps the camera connected to signaling, reconnecting with backoff, forever.
@@ -111,6 +112,26 @@ struct Viewer {
     commands: mpsc::Sender<Command>,
     task: JoinHandle<()>,
     viewing: bool,
+    /// Whose relay quota the session's allocations count against.
+    quota: Option<String>,
+}
+
+/// The part of a request's TURN username after the expiry time. It names the viewer client
+/// whose relay quota the session's allocations count against.
+fn quota_id(request: &proto::Webrtc) -> Option<String> {
+    request
+        .ice_configuration
+        .as_ref()?
+        .ice_servers
+        .iter()
+        .find_map(|server| {
+            server
+                .username
+                .rsplit(':')
+                .next()
+                .filter(|id| !id.is_empty())
+        })
+        .map(str::to_owned)
 }
 
 struct Signaling<'a> {
@@ -244,7 +265,12 @@ impl Signaling<'_> {
 
     async fn webrtc(&mut self, message: proto::Webrtc) -> Result<i64> {
         if message.webrtc_stream_status() == StreamStatus::Stop {
-            self.sessions.clear();
+            // A stop that names one of the sessions ends that one. Connect hasn't been seen to
+            // send any (a viewer that leaves is noticed when its connection drops), so one that
+            // names none ends them all, as before there were several.
+            if self.sessions.remove(&message.request_id).is_none() {
+                self.sessions.clear();
+            }
             return Ok(ack::OK);
         }
         if message.request_id.is_empty() {
@@ -294,11 +320,16 @@ impl Signaling<'_> {
             );
             return self.reject(request_id).await;
         }
-        // Attempts without a viewer, and any earlier session for this same request, give way.
-        // Dropping them ends them; the new session waits so their allocations are released first.
+        // An earlier session for this same request gives way, and so do the same viewer's
+        // attempts that never connected, which would hold its relay quota. Another viewer's
+        // attempt is left alone. Dropping them ends them; the new session waits so their
+        // allocations are released first.
+        let quota = quota_id(&request);
         let (replaced, kept): (HashMap<_, _>, HashMap<_, _>) = std::mem::take(&mut self.sessions)
             .into_iter()
-            .partition(|(id, viewer)| !viewer.viewing || *id == request_id);
+            .partition(|(id, viewer)| {
+                *id == request_id || (!viewer.viewing && (quota.is_none() || viewer.quota == quota))
+            });
         self.sessions = kept;
         let previous = replaced.into_values().map(|viewer| viewer.task).collect();
 
@@ -312,8 +343,7 @@ impl Signaling<'_> {
             previous,
             _alive: self.alive.clone(),
             request,
-            camera: self.camera.source.clone(),
-            sensor_size: self.camera.sensor_size,
+            hub: self.camera.hub.clone(),
             out: self.out.clone(),
             commands: receiver,
         }));
@@ -324,6 +354,7 @@ impl Signaling<'_> {
                 commands,
                 task,
                 viewing: false,
+                quota,
             },
         );
         Ok(())
@@ -495,13 +526,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_connected_viewer_blocks_a_new_request() {
+    fn only_connected_viewers_block_a_new_request() {
         let blocks = |sessions: &[(&'static str, bool)], id| {
             another_viewer_watching(sessions.iter().copied(), id)
         };
         assert!(!blocks(&[], "new"));
-        assert!(!blocks(&[("dead attempt", false)], "new"));
-        assert!(blocks(&[("watching", true)], "new"));
-        assert!(!blocks(&[("watching", true)], "watching"));
+        assert!(!blocks(&[("watching", true)], "new"));
+        assert!(!blocks(&[("a", true), ("dead attempt", false)], "new"));
+        assert!(blocks(&[("a", true), ("b", true)], "new"));
+        assert!(!blocks(&[("a", true), ("b", true)], "b"));
+    }
+
+    #[test]
+    fn reads_the_viewers_relay_quota() {
+        let request = |username: &str| proto::Webrtc {
+            ice_configuration: Some(proto::IceConfiguration {
+                ice_servers: vec![proto::IceServer {
+                    username: username.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            quota_id(&request("1763840000:5076904")).as_deref(),
+            Some("5076904")
+        );
+        assert_eq!(quota_id(&request("")), None);
+        assert_eq!(quota_id(&proto::Webrtc::default()), None);
     }
 }

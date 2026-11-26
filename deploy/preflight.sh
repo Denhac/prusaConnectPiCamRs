@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run on the Pi as the SSH user by deploy.sh, before anything is copied. Changes nothing.
-#   preflight.sh install|upgrade CHECK_CAMERA
+#   preflight.sh install|upgrade|add-local|remove-local|rtsp|remove-rtsp|api|remove-api CHECK_CAMERA
 set -uo pipefail
 
 mode=$1
@@ -21,7 +21,7 @@ elif [[ $check_camera == true ]]; then
   camera=$(timeout 20 rpicam-vid --list-cameras 2>/dev/null | sed -n 's/^ *0 : \([^ ]*\).*/\1/p')
   [[ -n $camera ]] || problems+=("no camera detected: check the ribbon cable (contacts facing the HDMI ports), then reboot, since cameras are only detected at boot")
 fi
-if [[ $mode == upgrade && ! -f /etc/prusa-connect-camera/config.toml ]]; then
+if [[ $mode != install && ! -f /etc/prusa-connect-camera/config.toml ]]; then
   problems+=("prusa-connect-camera isn't installed here yet; use install")
 fi
 

@@ -1,23 +1,30 @@
 mod config;
-mod connect;
-mod fingerprint;
-mod live;
+mod hub;
+mod net;
+mod outputs;
 mod runner;
+mod secret;
 mod source;
+mod status;
+mod supervise;
+mod uploader;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::config::Config;
+use crate::outputs::connect_cloud::fingerprint;
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Uploads Raspberry Pi camera snapshots to Prusa Connect"
+    about = "Sends Raspberry Pi camera pictures to Prusa Connect and self-hosted prusa-connect servers"
 )]
 struct Cli {
     /// Config file to use.
@@ -37,7 +44,7 @@ struct Cli {
 enum Command {
     /// Upload snapshots from every configured camera until stopped.
     Run,
-    /// Capture one frame, upload it, and report what Prusa Connect answered.
+    /// Capture one frame, send it to each of the camera's outputs, and report what each answered.
     Test {
         /// Camera id from the config. Optional when only one camera is configured.
         #[arg(long)]
@@ -54,10 +61,24 @@ enum Command {
     },
     /// List the cameras rpicam-vid can see, with their indexes and sensor modes.
     ListCameras,
-    /// Show a camera's fingerprint, or import one it is already registered with.
+    /// Show a camera's Prusa Connect fingerprint, or import one it is already registered with.
     Fingerprint {
         #[command(subcommand)]
         action: FingerprintAction,
+    },
+    /// Show what each output of the running service is doing. Exits 0 when all are uploading
+    /// or paused, 2 when a server refused credentials, 3 when an output keeps failing for
+    /// another reason, 4 while one is still starting, and 1 when there is no status to read.
+    Status {
+        /// Wait up to this many seconds for every output to upload, or for a refusal.
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+        /// The status file the service writes.
+        #[arg(long, default_value = status::DEFAULT_PATH)]
+        file: PathBuf,
+        /// Print nothing; only the exit code tells.
+        #[arg(short, long)]
+        quiet: bool,
     },
 }
 
@@ -91,7 +112,11 @@ fn main() -> ExitCode {
     // included, at trace. Neither is useful here, whatever RUST_LOG asks for.
     .filter_module("ureq_proto", log::LevelFilter::Info)
     .init();
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    if let Command::Status { wait, file, quiet } = &cli.command {
+        return ExitCode::from(show_status(file, Duration::from_secs(*wait), *quiet));
+    }
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             log::error!("{e:#}");
@@ -113,6 +138,7 @@ fn run(cli: Cli) -> Result<()> {
             snapshot(config.camera(camera.as_deref())?, &output)
         }
         Command::ListCameras => source::rpicam::list_cameras(),
+        Command::Status { .. } => unreachable!("handled in main"),
         Command::Fingerprint { action } => {
             let config = load_config()?;
             match action {
@@ -139,6 +165,41 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
     }
+}
+
+/// Prints the service's status file, after waiting up to `wait` for every output to upload or for
+/// a refusal, and returns the exit code that sums it up.
+fn show_status(file: &Path, wait: Duration, quiet: bool) -> u8 {
+    let deadline = Instant::now() + wait;
+    let (report, code) = loop {
+        let (report, code) = match status::read(file) {
+            Ok(report) => {
+                let code = report.verdict();
+                (Some(report), code)
+            }
+            Err(e) => {
+                if !quiet && Instant::now() >= deadline {
+                    eprintln!("{e:#}; is the service running?");
+                }
+                (None, status::exit::UNKNOWN)
+            }
+        };
+        let settled = matches!(code, status::exit::OK | status::exit::AUTH);
+        if settled || Instant::now() >= deadline {
+            break (report, code);
+        }
+        thread::sleep(Duration::from_secs(1));
+    };
+    if !quiet && let Some(report) = report {
+        for (label, output) in &report.outputs {
+            let state = serde_json::to_value(output.state)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            println!("{label:<24} {state:<9} {}", output.message);
+        }
+    }
+    code
 }
 
 fn snapshot(camera: &config::CameraConfig, output: &Path) -> Result<()> {

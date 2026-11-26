@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn import_refuses_to_replace_without_force() {
         let dir = temp_dir("import");
-        let a = "5702853b-a3e9-47e0-996e-4d0d4699dbbc";
+        let a = "7c1e5f3a-2b4d-4e6f-8a9b-0c1d2e3f4a5b";
         let b = "fingerprint-myprinter-camera-1";
         import(&dir, "cam0", a, false).unwrap();
         import(&dir, "cam0", a, false).unwrap();

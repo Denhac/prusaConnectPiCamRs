@@ -20,6 +20,9 @@ interval = 15
 # Offer live view in Prusa Connect. Needs a token from "Add web camera" rather than "Add new
 # other camera". Snapshots pause while someone watches.
 # live = false
+# Send to Prusa Connect at all. false suits a camera that only sends to the outputs in conf.d/,
+# such as a self-hosted prusa-connect server (see config.local.example.toml).
+# cloud = true
 
 [camera.source]
 type = "rpicam"
