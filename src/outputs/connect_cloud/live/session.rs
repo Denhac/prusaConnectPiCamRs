@@ -2,7 +2,7 @@
 //! the way Prusa's browser webcam does it. The camera makes the offer, both sides trickle ICE
 //! candidates through signaling, and a "ping-pong" data channel keeps the session alive.
 
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ use webrtc::rtp_transceiver::RtpSender;
 
 use super::proto::{self, ApplyScope, ConnectionType, IcePolicy, VideoQuality};
 use crate::hub::{Caps, Hub, Subscription};
+use crate::net::route_source;
 use crate::source::h264::nal_units;
 
 const PAYLOAD_TYPE: u8 = 102;
@@ -275,7 +276,9 @@ async fn serve(s: &mut Session, connected: &mut bool) -> Result<&'static str> {
         .with_setting_engine(settings)
         .with_handler(handler)
         .with_runtime(webrtc::runtime::default_runtime().context("no WebRTC runtime")?)
-        .with_udp_addrs(vec![SocketAddr::new(local_ip()?, 0)])
+        // The host candidate is the interface that routes to the internet. Viewers reach the
+        // camera over the internet or the LAN, never over a VPN such as Tailscale.
+        .with_udp_addrs(vec![SocketAddr::new(route_source()?, 0)])
         .build()
         .await?;
 
@@ -631,15 +634,6 @@ fn candidate_init(candidate: &str, mid: &str) -> RTCIceCandidateInit {
         sdp_mline_index: mid.is_empty().then_some(0),
         ..Default::default()
     }
-}
-
-/// The address of the interface that routes to the internet, for the host ICE candidate. Viewers
-/// reach the camera over the internet or the LAN, never over a VPN such as Tailscale.
-fn local_ip() -> Result<IpAddr> {
-    // Connecting a UDP socket sends nothing; it only selects the outgoing interface.
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("8.8.8.8:53")?;
-    Ok(socket.local_addr()?.ip())
 }
 
 /// The candidate types of the connection's selected pair.

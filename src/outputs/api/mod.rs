@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::hub::Hub;
-use crate::net::is_private;
+use crate::net::{is_private, is_tailscale, route_source};
 use crate::source::{FrameSource, Paused, Still};
 use crate::status::{State, Status};
 use crate::supervise::{self, Service};
@@ -68,17 +68,18 @@ pub struct Camera {
     pub hub: Option<Hub>,
 }
 
-/// Starts the API on a runtime of its own. `rtsp_port` is where live video is served, if it is.
+/// Starts the API on a runtime of its own. `rtsp` is the address the RTSP server listens on, when
+/// it serves live video.
 pub fn spawn(
     config: &Config,
     cameras: Vec<Camera>,
-    rtsp_port: Option<u16>,
+    rtsp: Option<SocketAddr>,
     status: Status,
 ) -> Result<Service> {
     let server = Arc::new(Server {
         listen: config.listen.parse()?,
         cameras,
-        rtsp_port,
+        rtsp,
         connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         refused: Mutex::default(),
         status,
@@ -94,7 +95,7 @@ pub fn spawn(
 struct Server {
     listen: SocketAddr,
     cameras: Vec<Camera>,
-    rtsp_port: Option<u16>,
+    rtsp: Option<SocketAddr>,
     connections: Arc<Semaphore>,
     refused: Mutex<HashSet<IpAddr>>,
     status: Status,
@@ -226,14 +227,37 @@ impl Server {
                 fps: s.framerate,
                 viewers,
             }),
-            rtsp: match (self.rtsp_port, &camera.hub) {
-                (Some(port), Some(_)) => {
-                    Some(format!("rtsp://{}/{}", host(local, port), camera.id))
-                }
+            rtsp: match (self.rtsp, &camera.hub) {
+                (Some(listen), Some(_)) => rtsp_ip(listen.ip(), local, route_source)
+                    .map(|ip| format!("rtsp://{}/{}", host(ip, listen.port()), camera.id)),
                 _ => None,
             },
         }
     }
+}
+
+/// The address to give clients for live video:
+/// - the RTSP listener's own address, when it is bound to one
+/// - otherwise the address the request reached the Pi on, which the client can reach
+/// - but never a Tailscale address, since Tailscale is for administering the Pis and video
+///   doesn't go over it: then the Pi's LAN address, which `lan` finds
+///
+/// `None` when the Pi has no address to give.
+fn rtsp_ip(
+    listen: IpAddr,
+    reached: IpAddr,
+    lan: impl FnOnce() -> std::io::Result<IpAddr>,
+) -> Option<IpAddr> {
+    if !listen.is_unspecified() {
+        return Some(listen);
+    }
+    let reached = reached.to_canonical();
+    // A listener on [::] takes IPv4 too, but one on 0.0.0.0 takes no IPv6.
+    let same_family = listen.is_ipv6() || reached.is_ipv4();
+    if same_family && !is_tailscale(reached) {
+        return Some(reached);
+    }
+    lan().ok().filter(|&ip| !is_tailscale(ip))
 }
 
 /// `address:port`, with brackets around an IPv6 address.
@@ -370,4 +394,76 @@ fn serve(still: Still, request: &Request) -> Response {
     Response::new(200, "image/jpeg", still.jpeg.to_vec())
         .header("ETag", etag)
         .header("Last-Modified", http_date(still.wall))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    const ANY: &str = "0.0.0.0";
+    const LAN: &str = "10.0.0.36";
+    const TAILSCALE: &str = "100.88.1.10";
+
+    fn lan() -> std::io::Result<IpAddr> {
+        Ok(ip(LAN))
+    }
+
+    fn unused() -> std::io::Result<IpAddr> {
+        panic!("the LAN address isn't needed here")
+    }
+
+    #[test]
+    fn rtsp_address_is_the_listeners_when_bound_to_one() {
+        assert_eq!(
+            rtsp_ip(ip("10.0.0.40"), ip(LAN), unused),
+            Some(ip("10.0.0.40"))
+        );
+        assert_eq!(
+            rtsp_ip(ip("127.0.0.1"), ip(TAILSCALE), unused),
+            Some(ip("127.0.0.1"))
+        );
+    }
+
+    #[test]
+    fn rtsp_address_is_the_one_the_client_reached() {
+        assert_eq!(rtsp_ip(ip(ANY), ip(LAN), unused), Some(ip(LAN)));
+        assert_eq!(
+            rtsp_ip(ip(ANY), ip("127.0.0.1"), unused),
+            Some(ip("127.0.0.1"))
+        );
+        assert_eq!(
+            rtsp_ip(ip(ANY), ip("::ffff:10.0.0.36"), unused),
+            Some(ip(LAN))
+        );
+        assert_eq!(
+            rtsp_ip(ip("::"), ip("fd00::5"), unused),
+            Some(ip("fd00::5"))
+        );
+    }
+
+    #[test]
+    fn rtsp_address_is_never_tailscale() {
+        assert_eq!(rtsp_ip(ip(ANY), ip(TAILSCALE), lan), Some(ip(LAN)));
+        assert_eq!(
+            rtsp_ip(ip("::"), ip("fd7a:115c:a1e0::1"), lan),
+            Some(ip(LAN))
+        );
+        // The Pi routes the internet through Tailscale, or has no route: no address to give.
+        assert_eq!(rtsp_ip(ip(ANY), ip(TAILSCALE), || Ok(ip(TAILSCALE))), None);
+        assert_eq!(
+            rtsp_ip(ip(ANY), ip(TAILSCALE), || Err(
+                std::io::ErrorKind::NetworkUnreachable.into()
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn rtsp_address_on_an_ipv4_listener_is_ipv4() {
+        assert_eq!(rtsp_ip(ip(ANY), ip("fd00::5"), lan), Some(ip(LAN)));
+    }
 }

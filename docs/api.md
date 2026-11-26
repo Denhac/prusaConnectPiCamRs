@@ -41,7 +41,7 @@ listens on port 8555 and answers at `http://<Pi>:8555/v1`.
 | `still.seq` | The newest still's number. It increases with each still; it is also the still's ETag. `null` before the first still. |
 | `still.captured_at`, `still.age_ms` | When the newest still was taken, by the Pi's clock, and how long ago. |
 | `video` | While `state` is `video`: `width`, `height`, `fps`, and `viewers`, the number of viewers sharing the stream. |
-| `rtsp` | The live stream's address, when the Pi serves one. |
+| `rtsp` | The live stream's address, when the Pi serves one: the address the RTSP server is bound to, or else the one your request reached the Pi on. It is never a Tailscale address: a request over Tailscale gets the Pi's LAN address. |
 
 ## `GET /v1/cameras/{id}`
 

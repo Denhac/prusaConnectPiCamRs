@@ -151,15 +151,14 @@ pub fn run(config: &Config) -> Result<()> {
     };
     let api = match &config.api {
         Some(api_config) => {
-            let rtsp_port = config
+            let rtsp_listen = config
                 .rtsp
                 .as_ref()
-                .and_then(|r| r.listen.parse::<std::net::SocketAddr>().ok())
-                .map(|a| a.port());
+                .and_then(|r| r.listen.parse::<std::net::SocketAddr>().ok());
             Some(api::spawn(
                 api_config,
                 api_cameras,
-                rtsp_port,
+                rtsp_listen,
                 status.clone(),
             )?)
         }

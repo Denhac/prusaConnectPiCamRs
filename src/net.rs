@@ -1,6 +1,16 @@
 //! Network facts shared by the outputs.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+
+/// The address of the interface this machine reaches the internet through: its LAN address, or
+/// its VPN address if it routes the internet through one. Connecting a UDP socket sends nothing;
+/// it only selects the outgoing interface.
+pub fn route_source() -> io::Result<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:53")?;
+    Ok(socket.local_addr()?.ip())
+}
 
 /// Whether `ip` is a Tailscale address: 100.64.0.0/10 or fd7a:115c:a1e0::/48. Tailscale is for
 /// administering the Pis; pictures and video never go over it.
