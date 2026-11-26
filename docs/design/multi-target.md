@@ -133,7 +133,7 @@ The phase 3 live test on xl (2026-11-22) worked:
   That needs a printer on the local server first: its UI shows cameras on printer pages and
   dashboard cards. Until then, mpv or VLC on the RTSP address is the same multi-viewer path.
 
-**After the first commit (5083987), on 2026-11-22:**
+**After the first commit (66e02a1), on 2026-11-22:**
 - **Robustness:**
   - `src/supervise.rs` puts each async part on its own runtime and thread, with a heartbeat the
     watchdog checks. Tasks that panic restart with backoff.
@@ -162,47 +162,33 @@ waiting for `rpicam-vid`, and systemd SIGKILLs it (seen on 2026-11-08 as well).
 
 ## State on 2026-11-25, and the printer test
 
+The test fleet's real host names, addresses and device IDs are kept out of the repo (in a
+gitignored `local/site.md`). Below, `camera-pi-<n>` is a camera Pi and `connect-pi` is the Pi
+that runs the prusa-connect server.
+
 **Fleet:**
-- All five Pis run build `1fa8d6ebe071` (commit 8946aeb).
-- On 2026-11-25 the bots were renamed `camera-pi-<n>` (hostname and Tailscale name), and
-  `camera-pi-5` became `connect-pi` on 2026-11-22. Each camera's display name in
-  `config.toml` still says `camera-pi-<n>`.
-
-  | Pi | LAN IP | Outputs |
-  |---|---|---|
-  | `camera-pi-2` | 10.0.0.19 | cloud, local (camera `camera-pi-2` on MK4S Blue), RTSP |
-  | `camera-pi-1` | 10.0.0.174 | cloud |
-  | `camera-pi-3` | 10.0.0.213 | cloud |
-  | `camera-pi-4` | 10.0.0.57 | cloud |
-  | `connect-pi` | 10.0.0.36 | cloud, local `xl-test` (camera `camera-pi-5`, no printer), RTSP, API |
-
-- The LAN DNS doesn't know the new names. Three Pis still have names from earlier installs
-  (`lan-name-2`, `lan-name-1`, `lan-name-3`), and orange is `camera-pi-4`.
-  On the Pis, a bare Pi name resolves through Tailscale, so stream addresses use LAN IPs until
-  the names are fixed.
-- Blue keeps its Prusa Connect output on purpose, as a test that both sides work at once.
+- All five Pis run build `1fa8d6ebe071` (commit 34c057c).
+- One camera Pi publishes to the local server, with its printer, and keeps its Prusa Connect
+  output on purpose, as a test that both sides work at once. `connect-pi` also pushes its own
+  camera to the server, with no printer. The others publish to Prusa Connect only.
+- Stream addresses use LAN IPs, not names: on the Pis a bare Pi name resolves through
+  Tailscale, and the LAN DNS doesn't know every Pi's current name.
 
 **Server:**
-- prusa-connect 0.1.0-beta.1 runs on `connect-pi` as the systemd service `prusa-connect`, as
-  the upstream "Install from a release" guide lays it out:
+- prusa-connect runs on `connect-pi` as the systemd service `prusa-connect`, as the upstream
+  "Install from a release" guide lays it out:
   - user `prusa-connect`
   - binary `/var/lib/prusa-connect/bin/prusa-connect`
   - `/etc/prusa-connect/config.yaml` from the release
   - data in `/var/lib/prusa-connect/config/config.d`
   - the wizard's `setup.yaml` in `/etc/prusa-connect/config.d`
-- Clients reach it at `http://connect.example.org:8080`, which resolves on the LAN
-  only.
-- `printer_address` is `http://connect-pi:8080`:
+- Clients reach it by a LAN-only DNS name on port 8080.
+- `printer_address` is a bare LAN name, `http://connect-pi:8080`:
   - printers keep at most 20 bytes of the hostname, and the server refuses a longer one at
     startup
-  - the LAN DNS (10.0.0.1) answers bare names
-- Printer: MK4S Blue (device `<device id>`), moved from Prusa
-  Connect on 2026-11-25.
-- Cameras: `camera-pi-2` on MK4S Blue (`stream_url = rtsp://10.0.0.19:8554/cam0`), and
-  `camera-pi-5` (`rtsp://10.0.0.36:8554/cam0`, no printer).
-- The old hand-run copy is in `/home/rpi/connect-pi`, as a backup.
+  - the LAN DNS answers bare names, and printers don't append a search domain
 
-**Done on 2026-11-25 with MK4S Blue and `camera-pi-2`:** steps 1 and 2 (with the command in
+**Done on 2026-11-25 with one printer and its camera:** steps 1 and 2 (with the command in
 step 7), stills on the server, and live view in the server's UI and in Prusa Connect at the same
 time from one encoder. The browser reached the server over Tailscale, so step 3's LAN-only
 client and step 5 are still open. Tokens last at most 365 days, a limit compiled into the
@@ -215,48 +201,47 @@ server, so the same command has to run again each year to renew them.
    - Load it from USB (Settings, Network, Prusa Connect, Load Settings), add the printer, and
      approve the code on the page.
    - A printer talks to one Connect server at a time, so it goes offline in Prusa Connect.
-2. **Put the camera on the printer:**
+2. **Put the camera on the printer.** For the camera on the server's own Pi:
 
    ```shell
-   deploy/provision-local.sh connect-pi --camera camera-pi-5 --id xl-test \
+   deploy/provision-local.sh connect-pi --camera <camera name> --id <output id> \
      --server http://connect-pi:8080 --push-url http://127.0.0.1:8080 --insecure-http \
      --rtsp --printer <device id>
    ```
 
-   - `--camera camera-pi-5` is needed because the host is no longer called that.
+   - `--camera` is needed when the camera's name isn't the host's name.
    - The device id is in `GET /api/v1/devices`.
    - The printer's grants are copied onto the camera the first time it is put on it.
 3. **Watch in the server's UI.** On the printer's Cameras tab:
    - the still is there
    - live view plays: the server reads the Pi's RTSP and relays it over WebRTC
-   - it works from a LAN-only client (a phone on the space's Wi-Fi with Tailscale off), since
+   - it works from a LAN-only client (a phone on the LAN's Wi-Fi with Tailscale off), since
      the relay also offers loopback and Tailscale candidates
 4. **Several viewers at once:**
    - the server's UI, Prusa Connect's (if the camera is still viewable there with its printer
-     gone), and `mpv rtsp://connect-pi:8554/cam0`
+     gone), and `mpv rtsp://<camera Pi's LAN IP>:8554/cam0`
    - expect the stream to drop to the lowest quality any viewer asked for
 5. **Long live view:** during a session of more than 5 minutes, the server's thumbnail goes
    blank (`stale`); check it comes back afterwards.
 6. **Decide per printer** whether to keep its Prusa Connect output once it has moved. It's
    `cloud = false` in `config.toml`; ask before editing it.
-7. **Other bots,** as blue was done (the camera and service account take the host's name), and
-   `https` once certbot is on:
+7. **Other bots** (the camera and service account take the host's name), and `https` once
+   certbot is on:
 
    ```shell
-   deploy/provision-local.sh camera-pi-2 --server http://connect-pi:8080 \
-     --push-url http://connect.example.org:8080 --insecure-http \
+   deploy/provision-local.sh camera-pi-<n> --server http://connect-pi:8080 \
+     --push-url http://<server's LAN name>:8080 --insecure-http \
      --rtsp --printer <device id>
    ```
 
 **Not done yet:**
 - **certbot TLS for browsers.** The API listener then speaks only TLS 1.3, which printers can't,
   so printers need a separate connector listener (`core.connectors.<name>.config.listener`):
-  plain HTTP on another port, or a private-CA ECDSA certificate naming `connect-pi`, with a
-  chain of at most 1024 bytes. Then `printer_address` takes that port, and printers load the
-  settings file again.
-- **Fixed LAN addresses or names** for 10.0.0.36 and 10.0.0.19, since the cameras'
-  `stream_url` uses the IP. Blue's address may already be fixed on the router, given its old
-  name there.
+  plain HTTP on another port, or a private-CA ECDSA certificate naming the bare server name,
+  with a chain of at most 1024 bytes. Then `printer_address` takes that port, and printers load
+  the settings file again.
+- **Fixed LAN addresses or names** for the server's Pi and the camera Pis, since the cameras'
+  `stream_url` uses the IP.
 - **Stills from live video** (plan in "The hub").
 - **The Slack module** (separate project), against docs/api.md.
 
