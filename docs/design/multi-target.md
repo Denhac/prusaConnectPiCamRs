@@ -160,15 +160,27 @@ The phase 3 live test on xl (2026-11-22) worked:
 **Already there before this work:** when the service stops, the program exits without
 waiting for `rpicam-vid`, and systemd SIGKILLs it (seen on 2026-11-08 as well).
 
-## State on 2026-11-22, and the printer test
+## State on 2026-11-25, and the printer test
 
 **Fleet:**
 - All five Pis run build `1fa8d6ebe071` (commit 8946aeb).
-- blue, green, black and orange are cloud-only.
-- `connect-pi` (formerly camera-pi-5, the XL's camera) also:
-  - pushes stills to the server running on itself (output `xl-test`, `http://127.0.0.1:8080`,
-    server camera `camera-pi-5`, token of `service_account:camera-pi-5` until 2027-11-22)
-  - serves RTSP on :8554 and the Pi API on :8555
+- On 2026-11-25 the bots were renamed `camera-pi-<n>` (hostname and Tailscale name), and
+  `camera-pi-5` became `connect-pi` on 2026-11-22. Each camera's display name in
+  `config.toml` still says `camera-pi-<n>`.
+
+  | Pi | LAN IP | Outputs |
+  |---|---|---|
+  | `camera-pi-2` | 10.0.0.19 | cloud, local (camera `camera-pi-2` on MK4S Blue), RTSP |
+  | `camera-pi-1` | 10.0.0.174 | cloud |
+  | `camera-pi-3` | 10.0.0.213 | cloud |
+  | `camera-pi-4` | 10.0.0.57 | cloud |
+  | `connect-pi` | 10.0.0.36 | cloud, local `xl-test` (camera `camera-pi-5`, no printer), RTSP, API |
+
+- The LAN DNS doesn't know the new names. Three Pis still have names from earlier installs
+  (`lan-name-2`, `lan-name-1`, `lan-name-3`), and orange is `camera-pi-4`.
+  On the Pis, a bare Pi name resolves through Tailscale, so stream addresses use LAN IPs until
+  the names are fixed.
+- Blue keeps its Prusa Connect output on purpose, as a test that both sides work at once.
 
 **Server:**
 - prusa-connect 0.1.0-beta.1 runs on `connect-pi` as the systemd service `prusa-connect`, as
@@ -184,11 +196,19 @@ waiting for `rpicam-vid`, and systemd SIGKILLs it (seen on 2026-11-08 as well).
   - printers keep at most 20 bytes of the hostname, and the server refuses a longer one at
     startup
   - the LAN DNS (10.0.0.1) answers bare names
-- It has camera `camera-pi-5` (generic, `stream_url = rtsp://10.0.0.36:8554/cam0`, no printer
-  yet), and no printers.
+- Printer: MK4S Blue (device `<device id>`), moved from Prusa
+  Connect on 2026-11-25.
+- Cameras: `camera-pi-2` on MK4S Blue (`stream_url = rtsp://10.0.0.19:8554/cam0`), and
+  `camera-pi-5` (`rtsp://10.0.0.36:8554/cam0`, no printer).
 - The old hand-run copy is in `/home/rpi/connect-pi`, as a backup.
 
-**When a printer is on the server, test:**
+**Done on 2026-11-25 with MK4S Blue and `camera-pi-2`:** steps 1 and 2 (with the command in
+step 7), stills on the server, and live view in the server's UI and in Prusa Connect at the same
+time from one encoder. The browser reached the server over Tailscale, so step 3's LAN-only
+client and step 5 are still open. Tokens last at most 365 days, a limit compiled into the
+server, so the same command has to run again each year to renew them.
+
+**The printer test:**
 1. **Move the printer.**
    - On the server's "Add a printer" page, download the settings file and check it says
      `hostname = connect-pi`, `port = 8080`, `tls = false`.
@@ -219,9 +239,14 @@ waiting for `rpicam-vid`, and systemd SIGKILLs it (seen on 2026-11-08 as well).
    blank (`stale`); check it comes back afterwards.
 6. **Decide per printer** whether to keep its Prusa Connect output once it has moved. It's
    `cloud = false` in `config.toml`; ask before editing it.
-7. **Other bots:** `provision-local.sh <pi> --server … --push-url
-   http://connect.example.org:8080 --insecure-http --rtsp --printer …`, and
-   `https` once certbot is on.
+7. **Other bots,** as blue was done (the camera and service account take the host's name), and
+   `https` once certbot is on:
+
+   ```shell
+   deploy/provision-local.sh camera-pi-2 --server http://connect-pi:8080 \
+     --push-url http://connect.example.org:8080 --insecure-http \
+     --rtsp --printer <device id>
+   ```
 
 **Not done yet:**
 - **certbot TLS for browsers.** The API listener then speaks only TLS 1.3, which printers can't,
@@ -229,7 +254,9 @@ waiting for `rpicam-vid`, and systemd SIGKILLs it (seen on 2026-11-08 as well).
   plain HTTP on another port, or a private-CA ECDSA certificate naming `connect-pi`, with a
   chain of at most 1024 bytes. Then `printer_address` takes that port, and printers load the
   settings file again.
-- **DHCP reservation** for 10.0.0.36, since the camera's `stream_url` uses the IP.
+- **Fixed LAN addresses or names** for 10.0.0.36 and 10.0.0.19, since the cameras'
+  `stream_url` uses the IP. Blue's address may already be fixed on the router, given its old
+  name there.
 - **Stills from live video** (plan in "The hub").
 - **The Slack module** (separate project), against docs/api.md.
 
